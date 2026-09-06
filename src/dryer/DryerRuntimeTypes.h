@@ -55,6 +55,8 @@ struct DryerRuntimeStatus {
     bool spoolmanConfigured = false;
     bool nfcAvailable = false;
     bool setupPortalActive = false;
+    bool homeAssistantConfigured = false;
+    bool homeAssistantConnected = false;
 
     DryerStationId selectedStation = DRYER_DEFAULT_STATION;
     DryerStationView stations[DRYER_STATION_COUNT];
