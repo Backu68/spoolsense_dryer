@@ -1,14 +1,15 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_PN532.h>
-#include <WiFi.h>
 
 #include "DryerConfig.h"
+#include "SetupPortal.h"
 #include "SpoolmanClient.h"
 
 // ---------- Pins ----------
@@ -33,6 +34,7 @@ constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
 
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+bool displayAvailable = false;
 
 // ---------- Temperature ----------
 
@@ -42,8 +44,15 @@ DallasTemperature temperatureSensor(&oneWire);
 // ---------- NFC ----------
 
 Adafruit_PN532 nfc(PN532_CS, &SPI);
-
 bool nfcAvailable = false;
+
+// ---------- Connectivity ----------
+
+DryerConfig dryerConfig;
+SetupPortal setupPortal;
+SpoolmanClient spoolman;
+
+bool wifiConnected = false;
 
 // ---------- Dryer state ----------
 
@@ -55,6 +64,8 @@ enum class DryerStation {
 struct StationState {
     bool occupied = false;
     String uid;
+    DryerSpoolInfo spool;
+    String lookupError;
 };
 
 DryerStation selectedStation = DryerStation::TOP;
@@ -80,7 +91,7 @@ unsigned long bottomDebounceTime = 0;
 unsigned long lastTemperatureRead = 0;
 float chamberTempC = DEVICE_DISCONNECTED_C;
 
-// Prevent the same tag from firing continuously while held on reader
+// Prevent the same tag from firing continuously while held on reader.
 String lastSeenUid;
 unsigned long lastTagSeenMs = 0;
 constexpr unsigned long TAG_REPEAT_BLOCK_MS = 2000;
@@ -110,6 +121,28 @@ StationState& getSelectedStation() {
     return bottomStation;
 }
 
+String getStationDisplayName(const StationState& state) {
+    if (!state.occupied) {
+        return "Empty";
+    }
+
+    if (state.spool.found) {
+        if (!state.spool.name.isEmpty()) {
+            return state.spool.name;
+        }
+
+        if (!state.spool.material.isEmpty()) {
+            return state.spool.material;
+        }
+    }
+
+    if (!state.lookupError.isEmpty()) {
+        return "Unknown spool";
+    }
+
+    return state.uid;
+}
+
 void drawStationLine(
     int y,
     const char* name,
@@ -118,29 +151,27 @@ void drawStationLine(
 ) {
     display.setCursor(0, y);
 
-    if (selectedStation == station) {
-        display.print(">");
-    } else {
-        display.print(" ");
-    }
-
+    display.print(selectedStation == station ? ">" : " ");
     display.print(name);
     display.print(": ");
 
-    if (!state.occupied) {
-        display.print("Empty");
-        return;
+    String label = getStationDisplayName(state);
+
+    // 128x64 at text size 1 gives roughly 21 characters across.
+    // Keep station rows on one line.
+    constexpr size_t MAX_LABEL_CHARS = 14;
+    if (label.length() > MAX_LABEL_CHARS) {
+        label = label.substring(0, MAX_LABEL_CHARS);
     }
 
-    // Temporary display until Spoolman gives us the actual spool name.
-    if (state.uid.length() <= 10) {
-        display.print(state.uid);
-    } else {
-        display.print(state.uid.substring(0, 10));
-    }
+    display.print(label);
 }
 
 void drawDisplay() {
+    if (!displayAvailable) {
+        return;
+    }
+
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
@@ -164,10 +195,14 @@ void drawDisplay() {
 
     display.setCursor(0, 44);
 
-    if (nfcAvailable) {
-        display.print("NFC: Ready");
-    } else {
+    if (!nfcAvailable) {
         display.print("NFC: ERROR");
+    } else if (setupPortal.isActive()) {
+        display.print("SETUP AP ACTIVE");
+    } else if (wifiConnected) {
+        display.print("WiFi: Connected");
+    } else {
+        display.print("WiFi: Offline");
     }
 
     display.setCursor(0, 54);
@@ -183,23 +218,177 @@ void drawDisplay() {
     display.display();
 }
 
+void printSpoolDetails(const DryerSpoolInfo& spool) {
+    Serial.println("Spoolman match:");
+    Serial.print("  Spool ID: ");
+    Serial.println(spool.spoolId);
+    Serial.print("  Vendor: ");
+    Serial.println(spool.vendor);
+    Serial.print("  Name: ");
+    Serial.println(spool.name);
+    Serial.print("  Material: ");
+    Serial.println(spool.material);
+    Serial.print("  Dry temp: ");
+
+    if (spool.dryTempC > 0) {
+        Serial.print(spool.dryTempC);
+        Serial.println(" C");
+    } else {
+        Serial.println("not set");
+    }
+
+    Serial.print("  Dry time: ");
+
+    if (spool.dryTimeHours > 0) {
+        Serial.print(spool.dryTimeHours);
+        Serial.println(" h");
+    } else {
+        Serial.println("not set");
+    }
+}
+
 void assignUidToSelectedStation(const String& uid) {
     StationState& station = getSelectedStation();
 
     station.occupied = true;
     station.uid = uid;
+    station.spool = DryerSpoolInfo{};
+    station.lookupError = "";
 
     Serial.print("Assigned UID ");
     Serial.print(uid);
     Serial.print(" to ");
+    Serial.println(
+        selectedStation == DryerStation::TOP
+            ? "TOP"
+            : "BOTTOM"
+    );
 
-    if (selectedStation == DryerStation::TOP) {
-        Serial.println("TOP");
+    drawDisplay();
+
+    if (!wifiConnected) {
+        station.lookupError = "WiFi offline";
+        Serial.println("Spoolman lookup skipped: WiFi offline.");
+        drawDisplay();
+        return;
+    }
+
+    if (!spoolman.isConfigured()) {
+        station.lookupError = "Spoolman not configured";
+        Serial.println("Spoolman lookup skipped: URL not configured.");
+        drawDisplay();
+        return;
+    }
+
+    String error;
+    DryerSpoolInfo spoolInfo;
+
+    Serial.print("Looking up NFC UID in Spoolman: ");
+    Serial.println(uid);
+
+    if (spoolman.lookupByUid(uid, spoolInfo, error)) {
+        station.spool = spoolInfo;
+        station.lookupError = "";
+        printSpoolDetails(station.spool);
     } else {
-        Serial.println("BOTTOM");
+        station.lookupError = error;
+        Serial.print("Spoolman lookup failed: ");
+        Serial.println(error);
     }
 
     drawDisplay();
+}
+
+// ---------- Wi-Fi ----------
+
+String makeHostname() {
+    uint64_t chipId = ESP.getEfuseMac();
+    char hostname[32];
+
+    snprintf(
+        hostname,
+        sizeof(hostname),
+        "spoolsense-dryer-%06llx",
+        static_cast<unsigned long long>(chipId & 0xFFFFFFULL)
+    );
+
+    return String(hostname);
+}
+
+bool connectWiFi() {
+    if (!dryerConfig.hasWiFi()) {
+        Serial.println("WiFi not configured.");
+        wifiConnected = false;
+        return false;
+    }
+
+    String hostname = makeHostname();
+
+    Serial.print("WiFi hostname: ");
+    Serial.println(hostname);
+
+    // Preserve the known-good SpoolSense DHCP hostname startup order.
+    WiFi.mode(WIFI_MODE_NULL);
+    delay(100);
+    WiFi.setHostname(hostname.c_str());
+    WiFi.mode(WIFI_STA);
+
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(dryerConfig.getSSID());
+
+    WiFi.begin(
+        dryerConfig.getSSID(),
+        dryerConfig.getPassword()
+    );
+
+    unsigned long start = millis();
+
+    while (
+        WiFi.status() != WL_CONNECTED &&
+        millis() - start < 15000
+    ) {
+        delay(250);
+        Serial.print(".");
+    }
+
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi connection failed.");
+        wifiConnected = false;
+        return false;
+    }
+
+    wifiConnected = true;
+
+    Serial.print("WiFi connected: ");
+    Serial.println(WiFi.localIP());
+
+    return true;
+}
+
+void configureSpoolman() {
+    if (!dryerConfig.hasSpoolman()) {
+        Serial.println("Spoolman URL not configured.");
+        return;
+    }
+
+    spoolman.setBaseUrl(dryerConfig.getSpoolmanURL());
+
+    Serial.print("Spoolman: ");
+    Serial.println(dryerConfig.getSpoolmanURL());
+}
+
+void startSetupPortal() {
+    if (setupPortal.begin(dryerConfig)) {
+        Serial.println();
+        Serial.println("=== SpoolSense Dryer Setup ===");
+        Serial.print("Connect to WiFi network: ");
+        Serial.println(setupPortal.getApSsid());
+        Serial.println("Then open: http://192.168.4.1");
+        Serial.println("===============================");
+        Serial.println();
+    }
 }
 
 // ---------- Buttons ----------
@@ -326,6 +515,9 @@ void setup() {
     Serial.println("SpoolSense Dryer");
     Serial.println("Firmware " FIRMWARE_VERSION);
 
+    dryerConfig.begin();
+    configureSpoolman();
+
     pinMode(PIN_BUTTON_TOP, INPUT_PULLUP);
     pinMode(PIN_BUTTON_BOTTOM, INPUT_PULLUP);
 
@@ -335,7 +527,9 @@ void setup() {
 
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
         Serial.println("SSD1306 initialization failed.");
+        displayAvailable = false;
     } else {
+        displayAvailable = true;
         Serial.println("SSD1306 initialized.");
     }
 
@@ -343,6 +537,12 @@ void setup() {
     Serial.println(temperatureSensor.getDeviceCount());
 
     initNfc();
+
+    drawDisplay();
+
+    if (!connectWiFi()) {
+        startSetupPortal();
+    }
 
     Serial.println("Dryer controller booted.");
 
@@ -352,6 +552,7 @@ void setup() {
 // ---------- Main loop ----------
 
 void loop() {
+    setupPortal.loop();
     handleButtons();
     handleNfc();
 
@@ -362,6 +563,10 @@ void loop() {
 
         temperatureSensor.requestTemperatures();
         chamberTempC = temperatureSensor.getTempCByIndex(0);
+
+        if (!setupPortal.isActive()) {
+            wifiConnected = WiFi.status() == WL_CONNECTED;
+        }
 
         Serial.print("Chamber temperature: ");
         Serial.print(chamberTempC);
