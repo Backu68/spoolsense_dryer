@@ -84,8 +84,21 @@ bool DryerSessionStore::save(
         return clear(station);
     }
 
+    // Once a full station record exists, active/complete session updates only
+    // need the mutable timer fields. This keeps periodic checkpoints cheap.
+    String occupiedKey = key(station, "occ");
+    bool existingRecord =
+        prefs_.isKey(occupiedKey.c_str()) &&
+        prefs_.getBool(occupiedKey.c_str(), false);
+
+    if (existingRecord &&
+        (state.sessionState == DryingSessionState::DRYING ||
+         state.sessionState == DryingSessionState::COMPLETE)) {
+        return checkpoint(station, state.sessionState, state.remainingSeconds);
+    }
+
     bool ok = true;
-    ok &= prefs_.putBool(key(station, "occ").c_str(), state.occupied) > 0;
+    ok &= prefs_.putBool(occupiedKey.c_str(), state.occupied) > 0;
     ok &= prefs_.putString(key(station, "uid").c_str(), state.uid) > 0;
     prefs_.putString(key(station, "err").c_str(), state.lookupError);
 
