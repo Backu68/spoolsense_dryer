@@ -20,6 +20,7 @@
 
 constexpr uint8_t PIN_TEMP = 27;
 constexpr uint8_t PIN_BUTTON_SELECT = 32;
+constexpr uint8_t PIN_BUTTON_CLEAR = 33;
 
 // Actual NodeMCU-32S silkscreen labels:
 //   OLED SDA -> P21 (GPIO21) -- NOT the nearby RX pin
@@ -65,7 +66,8 @@ bool wifiConnected = false;
 // ---------- Dryer state ----------
 
 // A single-spool dryer uses the lower station, so BOTTOM is the natural
-// power-on/default target. The one selector button cycles through stations.
+// power-on/default target. SELECT cycles the available stations; CLEAR removes
+// the currently selected spool assignment.
 DryerStation selectedStation = DryerStation::BOTTOM;
 DryerStationState topStation;
 DryerStationState bottomStation;
@@ -75,13 +77,19 @@ DryerStationState bottomStation;
 // station/zone-count refactor without changing its math.
 DryerTemperaturePlan temperaturePlan;
 
-// ---------- Button ----------
+// ---------- Buttons ----------
 
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
 
-bool lastButtonReading = HIGH;
-bool stableButtonState = HIGH;
-unsigned long buttonDebounceTime = 0;
+struct DebouncedButton {
+    uint8_t pin;
+    bool lastReading = HIGH;
+    bool stableState = HIGH;
+    unsigned long changedAt = 0;
+};
+
+DebouncedButton selectButton{PIN_BUTTON_SELECT};
+DebouncedButton clearButton{PIN_BUTTON_CLEAR};
 
 // ---------- Timing ----------
 
@@ -251,10 +259,9 @@ void recalculateTemperaturePlan() {
         sharedThresholdC = 0;
     }
 
-    // A newly loaded spool can change the shared target at any time. Waiting
-    // stations adopt that new target immediately. Already-running sessions keep
-    // their original wall-clock deadline because the new target is still inside
-    // their common valid drying range.
+    // A newly loaded or cleared spool can change the shared target at any time.
+    // Waiting stations adopt the recalculated threshold immediately. Already-
+    // running sessions keep their original wall-clock deadline.
     updateWaitingThreshold(
         DryerStation::TOP,
         topStation,
@@ -353,23 +360,13 @@ void updateStationSession(
             return;
         }
 
-        // The lower bound preserves the locked target-5 C rule. The upper
-        // bound prevents a newly-added lower-temperature spool from starting
-        // immediately while the chamber is still sitting at the old hotter
-        // setpoint. It must first settle near the newly calculated target.
-        int activeTargetC = state.spool.dryTempC;
-        if (
-            temperaturePlan.automaticPlanUsable &&
-            temperaturePlan.recommendedTargetC > 0
-        ) {
-            activeTargetC = temperaturePlan.recommendedTargetC;
-        }
-        int upperStartC = activeTargetC + SESSION_START_OFFSET_C;
-
+        // Countdown begins once the chamber reaches target - 5 C. If the
+        // chamber is already hotter than the newly recommended shared target,
+        // that still counts as drying time; the display tells the operator to
+        // reduce the manual dryer's setpoint while the timer continues.
         if (
             chamberTemperatureValid() &&
-            chamberTempC >= static_cast<float>(state.startThresholdC) &&
-            chamberTempC <= static_cast<float>(upperStartC)
+            chamberTempC >= static_cast<float>(state.startThresholdC)
         ) {
             state.sessionState = DryingSessionState::DRYING;
             state.lastSessionTickMs = now;
@@ -517,6 +514,9 @@ void clearRuntimeStation(bool top) {
 
     Serial.print("Cleared station: ");
     Serial.println(top ? "TOP" : "BOTTOM");
+
+    // Removing a spool changes the set of profiles sharing this thermal zone,
+    // so the recommended common temperature must be recalculated immediately.
     recalculateTemperaturePlan();
     drawDisplay();
 }
@@ -728,41 +728,46 @@ void startRuntimeWebUI() {
     }
 }
 
-// ---------- Button ----------
+// ---------- Buttons ----------
+
+bool buttonPressed(DebouncedButton& button, unsigned long now) {
+    bool reading = digitalRead(button.pin);
+
+    if (reading != button.lastReading) {
+        button.changedAt = now;
+        button.lastReading = reading;
+    }
+
+    if ((now - button.changedAt) < BUTTON_DEBOUNCE_MS) {
+        return false;
+    }
+
+    if (reading == button.stableState) {
+        return false;
+    }
+
+    button.stableState = reading;
+    return button.stableState == LOW;
+}
 
 void handleButtons() {
     unsigned long now = millis();
-    bool reading = digitalRead(PIN_BUTTON_SELECT);
 
-    if (reading != lastButtonReading) {
-        buttonDebounceTime = now;
-        lastButtonReading = reading;
+    if (buttonPressed(selectButton, now)) {
+        // Current prototype has two stations. This becomes index =
+        // (index + 1) % stationCount when variable station counts land.
+        selectedStation = selectedStation == DryerStation::BOTTOM
+            ? DryerStation::TOP
+            : DryerStation::BOTTOM;
+
+        Serial.print("Selected station: ");
+        Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
+        drawDisplay();
     }
 
-    if ((now - buttonDebounceTime) < BUTTON_DEBOUNCE_MS) {
-        return;
+    if (buttonPressed(clearButton, now)) {
+        clearRuntimeStation(selectedStation == DryerStation::TOP);
     }
-
-    if (reading == stableButtonState) {
-        return;
-    }
-
-    stableButtonState = reading;
-
-    if (stableButtonState != LOW) {
-        return;
-    }
-
-    // Current prototype has two stations. This becomes index = (index + 1) %
-    // stationCount when the variable-station refactor lands; the hardware stays
-    // one button regardless of how many shelves/stations are compiled in.
-    selectedStation = selectedStation == DryerStation::BOTTOM
-        ? DryerStation::TOP
-        : DryerStation::BOTTOM;
-
-    Serial.print("Selected station: ");
-    Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
-    drawDisplay();
 }
 
 // ---------- NFC ----------
@@ -831,6 +836,7 @@ void setup() {
     }
 
     pinMode(PIN_BUTTON_SELECT, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_CLEAR, INPUT_PULLUP);
 
     temperatureSensor.begin();
     initDisplay();
