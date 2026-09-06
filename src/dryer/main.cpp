@@ -8,6 +8,7 @@
 #include "DryerNfcI.h"
 #include "DryerRuntimeTypes.h"
 #include "DryerSessionStore.h"
+#include "DryerTemperaturePlanner.h"
 #include "DryerTimeService.h"
 #include "PN532DryerNfc.h"
 #include "RuntimeWebUI.h"
@@ -70,6 +71,11 @@ DryerStation selectedStation = DryerStation::BOTTOM;
 DryerStationState topStation;
 DryerStationState bottomStation;
 
+// Current hardware is one thermal zone shared by both spool stations. The
+// planner accepts an arbitrary number of profiles so it can survive the later
+// station/zone-count refactor without changing its math.
+DryerTemperaturePlan temperaturePlan;
+
 // ---------- Buttons ----------
 
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
@@ -98,6 +104,7 @@ constexpr unsigned long SESSION_PERSIST_INTERVAL_MS = 60000UL;
 
 DryerRuntimeStatus getRuntimeStatus();
 void drawDisplay();
+void recalculateTemperaturePlan();
 
 // ---------- Helpers ----------
 
@@ -145,6 +152,122 @@ void persistStation(DryerStation station, DryerStationState& state) {
     if (sessionStore.save(station, state)) {
         state.lastPersistMs = millis();
     }
+}
+
+uint8_t occupiedStationCount() {
+    uint8_t count = 0;
+    if (topStation.occupied) {
+        ++count;
+    }
+    if (bottomStation.occupied) {
+        ++count;
+    }
+    return count;
+}
+
+bool temperaturePlanBlocksNewStarts() {
+    return occupiedStationCount() > 1 && !temperaturePlan.automaticPlanUsable;
+}
+
+void updateWaitingThreshold(
+    DryerStation station,
+    DryerStationState& state,
+    int thresholdC
+) {
+    if (
+        state.sessionState != DryingSessionState::WAITING_FOR_TEMP ||
+        state.startThresholdC == thresholdC
+    ) {
+        return;
+    }
+
+    state.startThresholdC = thresholdC;
+    persistStation(station, state);
+}
+
+void printTemperaturePlan() {
+    Serial.print("Temperature plan: ");
+    Serial.println(DryerTemperaturePlanner::stateText(temperaturePlan.state));
+
+    if (temperaturePlan.spoolCount == 0) {
+        return;
+    }
+
+    if (temperaturePlan.automaticPlanUsable) {
+        Serial.print("  Shared target: ");
+        Serial.print(temperaturePlan.recommendedTargetC);
+        Serial.println(" C");
+
+        Serial.print("  Shared range: ");
+        Serial.print(temperaturePlan.commonMinC);
+        Serial.print("-");
+        Serial.print(temperaturePlan.commonMaxC);
+        Serial.println(" C");
+        return;
+    }
+
+    if (temperaturePlan.state == DryerTemperaturePlanState::COMPROMISE_REQUIRED) {
+        Serial.println("  WARNING: loaded drying ranges do not overlap.");
+        Serial.print("  Lowest required minimum: ");
+        Serial.print(temperaturePlan.commonMinC);
+        Serial.println(" C");
+        Serial.print("  Highest universally non-overtemperature candidate: ");
+        Serial.print(temperaturePlan.recommendedTargetC);
+        Serial.println(" C");
+        Serial.print("  Range gap: ");
+        Serial.print(temperaturePlan.compromiseGapC);
+        Serial.println(" C");
+        Serial.println("  Automatic compromise is disabled until time compensation is validated.");
+    } else if (temperaturePlan.state == DryerTemperaturePlanState::INVALID_PROFILE) {
+        Serial.println("  WARNING: a loaded spool is missing a usable drying profile.");
+    }
+}
+
+void recalculateTemperaturePlan() {
+    // An occupied station whose spool cannot be resolved is intentionally a
+    // blocker. We cannot safely recommend a shared chamber temperature when one
+    // loaded filament's limits are unknown.
+    bool unresolvedLoadedSpool =
+        (topStation.occupied && !topStation.spool.found) ||
+        (bottomStation.occupied && !bottomStation.spool.found);
+
+    const DryerSpoolInfo* profiles[2] = {
+        topStation.occupied ? &topStation.spool : nullptr,
+        bottomStation.occupied ? &bottomStation.spool : nullptr
+    };
+
+    temperaturePlan = DryerTemperaturePlanner::calculate(profiles, 2);
+
+    if (unresolvedLoadedSpool) {
+        temperaturePlan.state = DryerTemperaturePlanState::INVALID_PROFILE;
+        temperaturePlan.automaticPlanUsable = false;
+    }
+
+    printTemperaturePlan();
+
+    if (!temperaturePlan.automaticPlanUsable ||
+        temperaturePlan.recommendedTargetC <= 0) {
+        return;
+    }
+
+    int sharedThresholdC =
+        temperaturePlan.recommendedTargetC - SESSION_START_OFFSET_C;
+    if (sharedThresholdC < 0) {
+        sharedThresholdC = 0;
+    }
+
+    // If both spools are still waiting to begin, they should use the same
+    // chamber plan. Already-running sessions keep their original deadline.
+    updateWaitingThreshold(
+        DryerStation::TOP,
+        topStation,
+        sharedThresholdC
+    );
+    updateWaitingThreshold(
+        DryerStation::BOTTOM,
+        bottomStation,
+        sharedThresholdC
+    );
 }
 
 void restoreSessions() {
@@ -229,6 +352,10 @@ void updateStationSession(
     unsigned long now
 ) {
     if (state.sessionState == DryingSessionState::WAITING_FOR_TEMP) {
+        if (temperaturePlanBlocksNewStarts()) {
+            return;
+        }
+
         if (
             chamberTemperatureValid() &&
             chamberTempC >= static_cast<float>(state.startThresholdC)
@@ -342,6 +469,19 @@ DryerRuntimeStatus getRuntimeStatus() {
     status.spoolmanConfigured = dryerConfig.hasSpoolman();
     status.nfcAvailable = nfcAvailable;
     status.setupPortalActive = setupPortal.isActive();
+
+    status.temperaturePlan.state = temperaturePlan.state;
+    status.temperaturePlan.status =
+        DryerTemperaturePlanner::stateText(temperaturePlan.state);
+    status.temperaturePlan.spoolCount = temperaturePlan.spoolCount;
+    status.temperaturePlan.commonMinC = temperaturePlan.commonMinC;
+    status.temperaturePlan.commonMaxC = temperaturePlan.commonMaxC;
+    status.temperaturePlan.recommendedTargetC =
+        temperaturePlan.recommendedTargetC;
+    status.temperaturePlan.compromiseGapC = temperaturePlan.compromiseGapC;
+    status.temperaturePlan.automaticPlanUsable =
+        temperaturePlan.automaticPlanUsable;
+
     status.selectedStation = selectedStation;
     status.top = makeRuntimeStationView(topStation);
     status.bottom = makeRuntimeStationView(bottomStation);
@@ -366,6 +506,7 @@ void clearRuntimeStation(bool top) {
 
     Serial.print("Cleared station: ");
     Serial.println(top ? "TOP" : "BOTTOM");
+    recalculateTemperaturePlan();
     drawDisplay();
 }
 
@@ -382,8 +523,21 @@ void printSpoolDetails(const DryerSpoolInfo& spool) {
 
     Serial.print("  Dry temp: ");
     if (spool.dryTempC > 0) {
-        Serial.print(spool.dryTempC);
-        Serial.println(" C");
+        if (
+            spool.dryTempMinC > 0 &&
+            spool.dryTempMaxC > 0 &&
+            spool.dryTempMinC != spool.dryTempMaxC
+        ) {
+            Serial.print(spool.dryTempMinC);
+            Serial.print("-");
+            Serial.print(spool.dryTempMaxC);
+            Serial.print(" C; preferred ");
+            Serial.print(spool.dryTempC);
+            Serial.println(" C");
+        } else {
+            Serial.print(spool.dryTempC);
+            Serial.println(" C");
+        }
     } else {
         Serial.println("not set");
     }
@@ -420,6 +574,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.lookupError = "WiFi offline";
         Serial.println("Spoolman lookup skipped: WiFi offline.");
         persistStation(stationId, station);
+        recalculateTemperaturePlan();
         drawDisplay();
         return;
     }
@@ -428,6 +583,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.lookupError = "Spoolman not configured";
         Serial.println("Spoolman lookup skipped: URL not configured.");
         persistStation(stationId, station);
+        recalculateTemperaturePlan();
         drawDisplay();
         return;
     }
@@ -450,6 +606,7 @@ void assignUidToSelectedStation(const String& uid) {
         persistStation(stationId, station);
     }
 
+    recalculateTemperaturePlan();
     drawDisplay();
 }
 
@@ -665,6 +822,7 @@ void setup() {
 
     if (sessionStore.begin()) {
         restoreSessions();
+        recalculateTemperaturePlan();
     }
 
     pinMode(PIN_BUTTON_TOP, INPUT_PULLUP);
