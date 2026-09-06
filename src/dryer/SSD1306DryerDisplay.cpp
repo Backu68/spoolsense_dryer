@@ -34,7 +34,6 @@ bool SSD1306DryerDisplay::begin() {
         return false;
     }
 
-    // Wire is already initialized with the board-specific pins.
     if (!display_.begin(SSD1306_SWITCHCAPVCC, address_, true, false)) {
         Serial.println("SSD1306: initialization failed.");
         return false;
@@ -58,7 +57,7 @@ void SSD1306DryerDisplay::getDisplayInfo(char* buf, size_t len) const {
     snprintf(buf, len, "SSD1306 128x64 I2C");
 }
 
-String SSD1306DryerDisplay::stationLabel(const DryerStationView& state) {
+String SSD1306DryerDisplay::stationSpoolLabel(const DryerStationView& state) {
     if (!state.occupied) {
         return "Empty";
     }
@@ -118,22 +117,24 @@ String SSD1306DryerDisplay::sessionCompact(const DryerStationView& state) {
 
 void SSD1306DryerDisplay::drawStationLine(
     int y,
-    const char* name,
-    DryerStation station,
     const DryerStationView& state,
-    DryerStation selectedStation
+    DryerStationId selectedStation
 ) {
     display_.setCursor(0, y);
-    display_.print(selectedStation == station ? ">" : " ");
-    display_.print(name);
+    display_.print(selectedStation == state.id ? ">" : " ");
+
+    String stationName = state.label;
+    if (stationName.length() > 6) {
+        stationName = stationName.substring(0, 6);
+    }
+    display_.print(stationName);
     display_.print(":");
 
-    String label = stationLabel(state);
-    constexpr size_t MAX_LABEL_CHARS = 8;
+    String label = stationSpoolLabel(state);
+    constexpr size_t MAX_LABEL_CHARS = 7;
     if (label.length() > MAX_LABEL_CHARS) {
         label = label.substring(0, MAX_LABEL_CHARS);
     }
-
     display_.print(label);
 
     if (state.occupied) {
@@ -143,37 +144,43 @@ void SSD1306DryerDisplay::drawStationLine(
 }
 
 void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
-    if (!available_) {
+    if (!available_ || status.selectedStation >= DRYER_STATION_COUNT) {
         return;
     }
 
     display_.clearDisplay();
     display_.setTextColor(SSD1306_WHITE);
 
-    const bool sessionNeedsTemperature =
-        status.top.sessionStatus == "Waiting for temp" ||
-        status.top.sessionStatus == "Drying" ||
-        status.bottom.sessionStatus == "Waiting for temp" ||
-        status.bottom.sessionStatus == "Drying";
+    const DryerStationView& selected = status.stations[status.selectedStation];
+    const DryerZoneView& zone = status.zones[selected.zone];
 
-    // This tiny display has very little real estate. While the operator still
-    // needs to move the manual dryer's temperature toward the calculated shared
-    // target, use the entire OLED for that instruction. The drying countdown is
-    // allowed to run as soon as target-5 C is reached, including when the chamber
-    // starts above target; the large setpoint stays visible until the chamber is
-    // within about 1 C of the recommended value.
+    bool zoneHasActiveSession = false;
+    for (DryerStationId i = 0; i < DRYER_STATION_COUNT; ++i) {
+        const DryerStationView& station = status.stations[i];
+        if (station.zone != selected.zone) {
+            continue;
+        }
+        if (
+            station.sessionStatus == "Waiting for temp" ||
+            station.sessionStatus == "Drying"
+        ) {
+            zoneHasActiveSession = true;
+            break;
+        }
+    }
+
     bool showLargeSetpoint = false;
     if (
-        sessionNeedsTemperature &&
-        status.temperaturePlan.automaticPlanUsable &&
-        status.temperaturePlan.recommendedTargetC > 0
+        zoneHasActiveSession &&
+        zone.temperaturePlan.automaticPlanUsable &&
+        zone.temperaturePlan.recommendedTargetC > 0
     ) {
-        if (!status.temperatureValid) {
+        if (!zone.temperatureValid) {
             showLargeSetpoint = true;
         } else {
             float difference =
-                status.chamberTempC -
-                static_cast<float>(status.temperaturePlan.recommendedTargetC);
+                zone.chamberTempC -
+                static_cast<float>(zone.temperaturePlan.recommendedTargetC);
             if (difference < 0.0f) {
                 difference = -difference;
             }
@@ -182,7 +189,7 @@ void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
     }
 
     if (showLargeSetpoint) {
-        String target = String(status.temperaturePlan.recommendedTargetC) + "C";
+        String target = String(zone.temperaturePlan.recommendedTargetC) + "C";
 
         display_.setTextSize(5);
         int16_t x1 = 0;
@@ -208,22 +215,21 @@ void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
 
     display_.setTextSize(1);
     display_.setCursor(0, 0);
-    display_.println("SpoolSense Dryer");
+    display_.print("SpoolSense ");
+    display_.print(status.selectedStation + 1);
+    display_.print("/");
+    display_.println(DRYER_STATION_COUNT);
 
-    drawStationLine(
-        16,
-        "TOP",
-        DryerStation::TOP,
-        status.top,
-        status.selectedStation
-    );
-    drawStationLine(
-        28,
-        "BOT",
-        DryerStation::BOTTOM,
-        status.bottom,
-        status.selectedStation
-    );
+    if (DRYER_STATION_COUNT <= 2) {
+        for (DryerStationId i = 0; i < DRYER_STATION_COUNT; ++i) {
+            drawStationLine(16 + (12 * i), status.stations[i], status.selectedStation);
+        }
+    } else {
+        drawStationLine(16, selected, status.selectedStation);
+        DryerStationId next =
+            static_cast<DryerStationId>((status.selectedStation + 1) % DRYER_STATION_COUNT);
+        drawStationLine(28, status.stations[next], status.selectedStation);
+    }
 
     display_.setCursor(0, 44);
     if (!status.nfcAvailable) {
@@ -238,11 +244,16 @@ void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
     }
 
     display_.setCursor(0, 54);
+    if (DRYER_ZONE_COUNT > 1) {
+        display_.print("Z");
+        display_.print(selected.zone + 1);
+        display_.print(" ");
+    }
     display_.print("Temp: ");
-    if (!status.temperatureValid) {
+    if (!zone.temperatureValid) {
         display_.print("--.- C");
     } else {
-        display_.print(status.chamberTempC, 1);
+        display_.print(zone.chamberTempC, 1);
         display_.print(" C");
     }
 
