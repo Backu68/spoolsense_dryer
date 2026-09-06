@@ -72,7 +72,7 @@ void RuntimeWebUI::handleRoot() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SpoolSense Dryer</title>
 <style>
-:root{color-scheme:dark;font-family:Arial,sans-serif}body{margin:0;background:#111;color:#eee}.wrap{max-width:820px;margin:auto;padding:20px}h1{margin:0 0 16px}.summary,.station{background:#1d1d1d;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.station.selected{outline:2px solid #ddd}.title{display:flex;justify-content:space-between;align-items:center}.badge{font-size:12px;padding:4px 8px;border-radius:999px;background:#333}.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #2b2b2b}.row:last-child{border-bottom:0}.label{color:#aaa}.value{text-align:right;overflow-wrap:anywhere}button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:7px;font-weight:bold;font-size:15px;cursor:pointer}.muted{color:#aaa;font-size:13px}.ok{color:#8bd48b}.bad{color:#ff8d8d}
+:root{color-scheme:dark;font-family:Arial,sans-serif}body{margin:0;background:#111;color:#eee}.wrap{max-width:820px;margin:auto;padding:20px}h1{margin:0 0 16px}.summary,.station{background:#1d1d1d;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.station.selected{outline:2px solid #ddd}.title{display:flex;justify-content:space-between;align-items:center}.badge{font-size:12px;padding:4px 8px;border-radius:999px;background:#333}.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #2b2b2b}.row:last-child{border-bottom:0}.label{color:#aaa}.value{text-align:right;overflow-wrap:anywhere}button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:7px;font-weight:bold;font-size:15px;cursor:pointer}.muted{color:#aaa;font-size:13px}.ok{color:#8bd48b}.bad{color:#ff8d8d}.waiting{color:#ffd27a}.drying{color:#8bc9ff}.complete{color:#8bd48b;font-weight:bold}
 </style>
 </head>
 <body><div class="wrap">
@@ -90,7 +90,9 @@ void RuntimeWebUI::handleRoot() {
     <div class="row"><span class="label">Vendor</span><span id="topVendor" class="value">—</span></div>
     <div class="row"><span class="label">Material</span><span id="topMaterial" class="value">—</span></div>
     <div class="row"><span class="label">Dry temp</span><span id="topDryTemp" class="value">—</span></div>
-    <div class="row"><span class="label">Dry time</span><span id="topDryTime" class="value">—</span></div>
+    <div class="row"><span class="label">Countdown starts</span><span id="topThreshold" class="value">—</span></div>
+    <div class="row"><span class="label">Session</span><span id="topSession" class="value">Inactive</span></div>
+    <div class="row"><span class="label">Remaining</span><span id="topRemaining" class="value">—</span></div>
     <div class="row"><span class="label">UID</span><span id="topUid" class="value">—</span></div>
     <div id="topError" class="muted"></div>
     <button onclick="clearStation('top')">Clear TOP</button>
@@ -101,17 +103,24 @@ void RuntimeWebUI::handleRoot() {
     <div class="row"><span class="label">Vendor</span><span id="bottomVendor" class="value">—</span></div>
     <div class="row"><span class="label">Material</span><span id="bottomMaterial" class="value">—</span></div>
     <div class="row"><span class="label">Dry temp</span><span id="bottomDryTemp" class="value">—</span></div>
-    <div class="row"><span class="label">Dry time</span><span id="bottomDryTime" class="value">—</span></div>
+    <div class="row"><span class="label">Countdown starts</span><span id="bottomThreshold" class="value">—</span></div>
+    <div class="row"><span class="label">Session</span><span id="bottomSession" class="value">Inactive</span></div>
+    <div class="row"><span class="label">Remaining</span><span id="bottomRemaining" class="value">—</span></div>
     <div class="row"><span class="label">UID</span><span id="bottomUid" class="value">—</span></div>
     <div id="bottomError" class="muted"></div>
     <button onclick="clearStation('bottom')">Clear BOTTOM</button>
   </div>
 </div>
-<p class="muted">Live status refreshes automatically.</p>
+<p class="muted">Countdown begins automatically when chamber temperature reaches 5 °C below the spool's drying temperature.</p>
 </div>
 <script>
 const el=id=>document.getElementById(id);
 function setHealth(id,ok,good,bad){const n=el(id);n.textContent=ok?good:bad;n.className='value '+(ok?'ok':'bad')}
+function formatRemaining(seconds){
+  if(seconds===null||seconds===undefined)return '—';
+  const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;
+  return h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+}
 function updateStation(prefix,s,selected){
   el(prefix+'Card').classList.toggle('selected',selected);
   el(prefix+'Selected').style.visibility=selected?'visible':'hidden';
@@ -119,7 +128,11 @@ function updateStation(prefix,s,selected){
   el(prefix+'Vendor').textContent=s.vendor||'—';
   el(prefix+'Material').textContent=s.material||'—';
   el(prefix+'DryTemp').textContent=s.dry_temp_c>0?s.dry_temp_c+' °C':'—';
-  el(prefix+'DryTime').textContent=s.dry_time_hours>0?s.dry_time_hours+' h':'—';
+  el(prefix+'Threshold').textContent=s.start_threshold_c>0?s.start_threshold_c+' °C':'—';
+  const session=el(prefix+'Session');
+  session.textContent=s.session_status||'Inactive';
+  session.className='value '+(s.session_status==='Waiting for temp'?'waiting':s.session_status==='Drying'?'drying':s.session_status==='Complete'?'complete':'');
+  el(prefix+'Remaining').textContent=(s.session_status&&s.session_status!=='Inactive')?formatRemaining(s.remaining_seconds):'—';
   el(prefix+'Uid').textContent=s.uid||'—';
   el(prefix+'Error').textContent=s.lookup_error||'';
 }
@@ -168,6 +181,9 @@ void RuntimeWebUI::handleStatus() {
         target["material"] = station.spool.material;
         target["dry_temp_c"] = station.spool.dryTempC;
         target["dry_time_hours"] = station.spool.dryTimeHours;
+        target["session_status"] = station.sessionStatus;
+        target["remaining_seconds"] = station.remainingSeconds;
+        target["start_threshold_c"] = station.startThresholdC;
     };
 
     addStation(doc["top"].to<JsonObject>(), status.top);
