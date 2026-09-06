@@ -73,13 +73,16 @@ void RuntimeWebUI::handleRoot() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SpoolSense Dryer</title>
 <style>
-:root{color-scheme:dark;font-family:Arial,sans-serif}body{margin:0;background:#111;color:#eee}.wrap{max-width:820px;margin:auto;padding:20px}h1{margin:0 0 16px}.summary,.station{background:#1d1d1d;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.station.selected{outline:2px solid #ddd}.title{display:flex;justify-content:space-between;align-items:center}.badge{font-size:12px;padding:4px 8px;border-radius:999px;background:#333}.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #2b2b2b}.row:last-child{border-bottom:0}.label{color:#aaa}.value{text-align:right;overflow-wrap:anywhere}button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:7px;font-weight:bold;font-size:15px;cursor:pointer}.muted{color:#aaa;font-size:13px}.ok{color:#8bd48b}.bad{color:#ff8d8d}.waiting{color:#ffd27a}.drying{color:#8bc9ff}.complete{color:#8bd48b;font-weight:bold}
+:root{color-scheme:dark;font-family:Arial,sans-serif}body{margin:0;background:#111;color:#eee}.wrap{max-width:820px;margin:auto;padding:20px}h1{margin:0 0 16px}.summary,.station{background:#1d1d1d;border:1px solid #333;border-radius:12px;padding:16px;margin-bottom:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}.station.selected{outline:2px solid #ddd}.title{display:flex;justify-content:space-between;align-items:center}.badge{font-size:12px;padding:4px 8px;border-radius:999px;background:#333}.row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #2b2b2b}.row:last-child{border-bottom:0}.label{color:#aaa}.value{text-align:right;overflow-wrap:anywhere}button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:7px;font-weight:bold;font-size:15px;cursor:pointer}.muted{color:#aaa;font-size:13px}.ok{color:#8bd48b}.bad{color:#ff8d8d}.waiting{color:#ffd27a}.drying{color:#8bc9ff}.complete{color:#8bd48b;font-weight:bold}.warning{color:#ffd27a;font-weight:bold}
 </style>
 </head>
 <body><div class="wrap">
 <h1>SpoolSense Dryer</h1>
 <div class="summary">
   <div class="row"><span class="label">Chamber</span><span id="temp" class="value">--.- &deg;C</span></div>
+  <div class="row"><span class="label">Drying plan</span><span id="planStatus" class="value">...</span></div>
+  <div class="row"><span class="label">Shared target</span><span id="planTarget" class="value">&mdash;</span></div>
+  <div class="row"><span class="label">Shared range</span><span id="planRange" class="value">&mdash;</span></div>
   <div class="row"><span class="label">Wi-Fi</span><span id="wifi" class="value">...</span></div>
   <div class="row"><span class="label">Spoolman</span><span id="spoolman" class="value">...</span></div>
   <div class="row"><span class="label">NFC</span><span id="nfc" class="value">...</span></div>
@@ -112,7 +115,7 @@ void RuntimeWebUI::handleRoot() {
     <button onclick="clearStation('bottom')">Clear BOTTOM</button>
   </div>
 </div>
-<p class="muted">Countdown begins automatically when chamber temperature reaches 5 &deg;C below the spool's drying temperature.</p>
+<p class="muted">For a usable shared plan, countdown begins 5 &deg;C below the calculated chamber target. Non-overlapping ranges are warned and automatic session starts are blocked.</p>
 </div>
 <script>
 const el=id=>document.getElementById(id);
@@ -124,13 +127,38 @@ function formatRemaining(seconds){
   const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;
   return h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
 }
+function formatDryTemp(s){
+  const p=s.dry_temp_c||0,min=s.dry_temp_min_c||0,max=s.dry_temp_max_c||0;
+  if(!p)return DASH;
+  if(min>0&&max>0&&min!==max)return min+'-'+max+DEG_C+' (pref '+p+DEG_C+')';
+  return p+DEG_C;
+}
+function updatePlan(p){
+  const status=el('planStatus');
+  status.textContent=p.status||'No drying profile';
+  status.className='value '+(p.automatic_usable?'ok':(p.spool_count>1?'warning':''));
+  if(p.recommended_target_c>0){
+    el('planTarget').textContent=p.recommended_target_c+DEG_C+(p.automatic_usable?'':' (advisory)');
+  }else{
+    el('planTarget').textContent=DASH;
+  }
+  if(p.common_min_c>0&&p.common_max_c>0){
+    if(p.common_min_c<=p.common_max_c){
+      el('planRange').textContent=p.common_min_c+'-'+p.common_max_c+DEG_C;
+    }else{
+      el('planRange').textContent='No overlap; gap '+p.compromise_gap_c+DEG_C;
+    }
+  }else{
+    el('planRange').textContent=DASH;
+  }
+}
 function updateStation(prefix,s,selected){
   el(prefix+'Card').classList.toggle('selected',selected);
   el(prefix+'Selected').style.visibility=selected?'visible':'hidden';
   el(prefix+'Name').textContent=s.occupied?(s.name||s.material||'Unknown spool'):'Empty';
   el(prefix+'Vendor').textContent=s.vendor||DASH;
   el(prefix+'Material').textContent=s.material||DASH;
-  el(prefix+'DryTemp').textContent=s.dry_temp_c>0?s.dry_temp_c+DEG_C:DASH;
+  el(prefix+'DryTemp').textContent=formatDryTemp(s);
   el(prefix+'Threshold').textContent=s.start_threshold_c>0?s.start_threshold_c+DEG_C:DASH;
   const session=el(prefix+'Session');
   session.textContent=s.session_status||'Inactive';
@@ -143,6 +171,7 @@ async function refresh(){
   try{
     const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();
     el('temp').textContent=s.temperature_valid?s.temperature_c.toFixed(2)+DEG_C:'--.-'+DEG_C;
+    updatePlan(s.temperature_plan||{});
     setHealth('wifi',s.wifi_connected,s.ip_address||'Connected','Offline');
     setHealth('spoolman',s.spoolman_configured,'Configured','Not configured');
     setHealth('nfc',s.nfc_available,'Ready','Unavailable');
@@ -174,6 +203,15 @@ void RuntimeWebUI::handleStatus() {
     doc["nfc_available"] = status.nfcAvailable;
     doc["selected"] = status.selectedStation == DryerStation::TOP ? "top" : "bottom";
 
+    JsonObject plan = doc["temperature_plan"].to<JsonObject>();
+    plan["status"] = status.temperaturePlan.status;
+    plan["spool_count"] = status.temperaturePlan.spoolCount;
+    plan["common_min_c"] = status.temperaturePlan.commonMinC;
+    plan["common_max_c"] = status.temperaturePlan.commonMaxC;
+    plan["recommended_target_c"] = status.temperaturePlan.recommendedTargetC;
+    plan["compromise_gap_c"] = status.temperaturePlan.compromiseGapC;
+    plan["automatic_usable"] = status.temperaturePlan.automaticPlanUsable;
+
     auto addStation = [](JsonObject target, const DryerStationView& station) {
         target["occupied"] = station.occupied;
         target["uid"] = station.uid;
@@ -184,6 +222,8 @@ void RuntimeWebUI::handleStatus() {
         target["vendor"] = station.spool.vendor;
         target["material"] = station.spool.material;
         target["dry_temp_c"] = station.spool.dryTempC;
+        target["dry_temp_min_c"] = station.spool.dryTempMinC;
+        target["dry_temp_max_c"] = station.spool.dryTempMaxC;
         target["dry_time_hours"] = station.spool.dryTimeHours;
         target["session_status"] = station.sessionStatus;
         target["remaining_seconds"] = station.remainingSeconds;
