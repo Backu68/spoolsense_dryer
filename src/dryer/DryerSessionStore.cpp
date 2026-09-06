@@ -17,16 +17,27 @@ bool DryerSessionStore::begin() {
     return true;
 }
 
-String DryerSessionStore::key(DryerStation station, const char* suffix) const {
-    String result = station == DryerStation::TOP ? "t_" : "b_";
+String DryerSessionStore::key(DryerStationId station, const char* suffix) const {
+    String result;
+
+    // Preserve the existing retrofit key names so current saved TOP/BOTTOM
+    // assignments and timer deadlines survive the variable-station refactor.
+    if (station == 0) {
+        result = "t_";
+    } else if (station == 1) {
+        result = "b_";
+    } else {
+        result = "s" + String(static_cast<unsigned int>(station)) + "_";
+    }
+
     result += suffix;
     return result;
 }
 
-bool DryerSessionStore::load(DryerStation station, DryerStationState& state) {
+bool DryerSessionStore::load(DryerStationId station, DryerStationState& state) {
     state = DryerStationState{};
 
-    if (!ready_) {
+    if (!ready_ || station >= DRYER_STATION_COUNT) {
         return false;
     }
 
@@ -57,8 +68,6 @@ bool DryerSessionStore::load(DryerStation station, DryerStationState& state) {
     );
     state.spool.dryTimeHours = prefs_.getInt(key(station, "dhrs").c_str(), 0);
 
-    // Records written before range support remain valid as single-temperature
-    // profiles instead of forcing an NVS format reset.
     if (state.spool.dryTempMinC <= 0) {
         state.spool.dryTempMinC = state.spool.dryTempC;
     }
@@ -77,19 +86,16 @@ bool DryerSessionStore::load(DryerStation station, DryerStationState& state) {
     state.startThresholdC = prefs_.getInt(key(station, "thresh").c_str(), 0);
     state.finishEpoch = prefs_.getUInt(key(station, "finish").c_str(), 0);
 
-    // Do not force an interrupted DRYING session back to WAITING. When a
-    // persisted finishEpoch is present, wall-clock reconciliation after NTP
-    // synchronization accounts for time that elapsed while the ESP32 was down.
     state.lastSessionTickMs = millis();
     state.lastPersistMs = millis();
     return true;
 }
 
 bool DryerSessionStore::save(
-    DryerStation station,
+    DryerStationId station,
     const DryerStationState& state
 ) {
-    if (!ready_) {
+    if (!ready_ || station >= DRYER_STATION_COUNT) {
         return false;
     }
 
@@ -97,8 +103,6 @@ bool DryerSessionStore::save(
         return clear(station);
     }
 
-    // Once a full station record exists, active/complete session updates only
-    // need the mutable timer fields. This keeps periodic checkpoints cheap.
     String occupiedKey = key(station, "occ");
     bool existingRecord =
         prefs_.isKey(occupiedKey.c_str()) &&
@@ -144,12 +148,12 @@ bool DryerSessionStore::save(
 }
 
 bool DryerSessionStore::checkpoint(
-    DryerStation station,
+    DryerStationId station,
     DryingSessionState sessionState,
     uint32_t remainingSeconds,
     uint32_t finishEpoch
 ) {
-    if (!ready_) {
+    if (!ready_ || station >= DRYER_STATION_COUNT) {
         return false;
     }
 
@@ -162,8 +166,8 @@ bool DryerSessionStore::checkpoint(
     return true;
 }
 
-bool DryerSessionStore::clear(DryerStation station) {
-    if (!ready_) {
+bool DryerSessionStore::clear(DryerStationId station) {
+    if (!ready_ || station >= DRYER_STATION_COUNT) {
         return false;
     }
 
