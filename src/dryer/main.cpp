@@ -7,6 +7,7 @@
 #include "DryerDisplayI.h"
 #include "DryerNfcI.h"
 #include "DryerRuntimeTypes.h"
+#include "DryerSessionStore.h"
 #include "PN532DryerNfc.h"
 #include "RuntimeWebUI.h"
 #include "SSD1306DryerDisplay.h"
@@ -49,9 +50,10 @@ bool nfcAvailable = false;
 OneWire oneWire(PIN_TEMP);
 DallasTemperature temperatureSensor(&oneWire);
 
-// ---------- Connectivity ----------
+// ---------- Connectivity / persistence ----------
 
 DryerConfig dryerConfig;
+DryerSessionStore sessionStore;
 SetupPortal setupPortal;
 RuntimeWebUI runtimeWebUI;
 SpoolmanClient spoolman;
@@ -60,24 +62,11 @@ bool wifiConnected = false;
 
 // ---------- Dryer state ----------
 
-struct StationState {
-    bool occupied = false;
-    String uid;
-    DryerSpoolInfo spool;
-    String lookupError;
-
-    DryingSessionState sessionState = DryingSessionState::INACTIVE;
-    uint32_t totalSeconds = 0;
-    uint32_t remainingSeconds = 0;
-    int startThresholdC = 0;
-    unsigned long lastSessionTickMs = 0;
-};
-
 // A single-spool dryer uses the lower station, so BOTTOM is the natural
 // power-on/default target. TOP remains available when the second station is used.
 DryerStation selectedStation = DryerStation::BOTTOM;
-StationState topStation;
-StationState bottomStation;
+DryerStationState topStation;
+DryerStationState bottomStation;
 
 // ---------- Buttons ----------
 
@@ -101,6 +90,7 @@ unsigned long lastTagSeenMs = 0;
 constexpr unsigned long TAG_REPEAT_BLOCK_MS = 2000;
 
 constexpr int SESSION_START_OFFSET_C = 5;
+constexpr unsigned long SESSION_PERSIST_INTERVAL_MS = 60000UL;
 
 // ---------- Forward declarations ----------
 
@@ -129,7 +119,7 @@ String uidToString(const uint8_t* uid, uint8_t uidLength) {
     return result;
 }
 
-StationState& getSelectedStation() {
+DryerStationState& getSelectedStation() {
     return selectedStation == DryerStation::TOP
         ? topStation
         : bottomStation;
@@ -149,7 +139,41 @@ const char* sessionStateText(DryingSessionState state) {
     }
 }
 
-void configureStationSession(StationState& state, const char* stationName) {
+void persistStation(DryerStation station, DryerStationState& state) {
+    if (sessionStore.save(station, state)) {
+        state.lastPersistMs = millis();
+    }
+}
+
+void restoreSessions() {
+    if (sessionStore.load(DryerStation::TOP, topStation)) {
+        Serial.print("Restored TOP session: ");
+        Serial.print(sessionStateText(topStation.sessionState));
+        Serial.print(", remaining ");
+        Serial.print(topStation.remainingSeconds);
+        Serial.println(" s.");
+
+        // load() intentionally converts an interrupted DRYING session back to
+        // WAITING_FOR_TEMP. Save that safe post-reboot state immediately.
+        persistStation(DryerStation::TOP, topStation);
+    }
+
+    if (sessionStore.load(DryerStation::BOTTOM, bottomStation)) {
+        Serial.print("Restored BOTTOM session: ");
+        Serial.print(sessionStateText(bottomStation.sessionState));
+        Serial.print(", remaining ");
+        Serial.print(bottomStation.remainingSeconds);
+        Serial.println(" s.");
+
+        persistStation(DryerStation::BOTTOM, bottomStation);
+    }
+}
+
+void configureStationSession(
+    DryerStation station,
+    DryerStationState& state,
+    const char* stationName
+) {
     state.sessionState = DryingSessionState::INACTIVE;
     state.totalSeconds = 0;
     state.remainingSeconds = 0;
@@ -161,6 +185,7 @@ void configureStationSession(StationState& state, const char* stationName) {
         state.spool.dryTimeHours <= 0) {
         Serial.print(stationName);
         Serial.println(" drying session inactive: dry profile is incomplete.");
+        persistStation(station, state);
         return;
     }
 
@@ -179,10 +204,13 @@ void configureStationSession(StationState& state, const char* stationName) {
     Serial.print(" C; duration ");
     Serial.print(state.spool.dryTimeHours);
     Serial.println(" h.");
+
+    persistStation(station, state);
 }
 
 void updateStationSession(
-    StationState& state,
+    DryerStation station,
+    DryerStationState& state,
     const char* stationName,
     unsigned long now
 ) {
@@ -199,6 +227,7 @@ void updateStationSession(
             Serial.print(chamberTempC, 2);
             Serial.println(" C.");
 
+            persistStation(station, state);
             drawDisplay();
         }
         return;
@@ -222,14 +251,19 @@ void updateStationSession(
 
         Serial.print(stationName);
         Serial.println(" drying complete.");
+        persistStation(station, state);
         drawDisplay();
         return;
     }
 
     state.remainingSeconds -= elapsedSeconds;
+
+    if ((now - state.lastPersistMs) >= SESSION_PERSIST_INTERVAL_MS) {
+        persistStation(station, state);
+    }
 }
 
-DryerStationView makeRuntimeStationView(const StationState& state) {
+DryerStationView makeRuntimeStationView(const DryerStationState& state) {
     DryerStationView view;
     view.occupied = state.occupied;
     view.uid = state.uid;
@@ -265,8 +299,10 @@ void drawDisplay() {
 }
 
 void clearRuntimeStation(bool top) {
-    StationState& station = top ? topStation : bottomStation;
-    station = StationState{};
+    DryerStation stationId = top ? DryerStation::TOP : DryerStation::BOTTOM;
+    DryerStationState& station = top ? topStation : bottomStation;
+    station = DryerStationState{};
+    sessionStore.clear(stationId);
 
     // Allow the same tag to be rescanned immediately after a manual clear.
     lastSeenUid = "";
@@ -306,14 +342,16 @@ void printSpoolDetails(const DryerSpoolInfo& spool) {
 }
 
 void assignUidToSelectedStation(const String& uid) {
-    StationState& station = getSelectedStation();
+    DryerStationState& station = getSelectedStation();
+    const DryerStation stationId = selectedStation;
     const char* stationName =
         selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM";
 
     // A new scan replaces the prior station assignment and session.
-    station = StationState{};
+    station = DryerStationState{};
     station.occupied = true;
     station.uid = uid;
+    persistStation(stationId, station);
 
     Serial.print("Assigned UID ");
     Serial.print(uid);
@@ -325,6 +363,7 @@ void assignUidToSelectedStation(const String& uid) {
     if (!wifiConnected) {
         station.lookupError = "WiFi offline";
         Serial.println("Spoolman lookup skipped: WiFi offline.");
+        persistStation(stationId, station);
         drawDisplay();
         return;
     }
@@ -332,6 +371,7 @@ void assignUidToSelectedStation(const String& uid) {
     if (!spoolman.isConfigured()) {
         station.lookupError = "Spoolman not configured";
         Serial.println("Spoolman lookup skipped: URL not configured.");
+        persistStation(stationId, station);
         drawDisplay();
         return;
     }
@@ -346,11 +386,12 @@ void assignUidToSelectedStation(const String& uid) {
         station.spool = spoolInfo;
         station.lookupError = "";
         printSpoolDetails(station.spool);
-        configureStationSession(station, stationName);
+        configureStationSession(stationId, station, stationName);
     } else {
         station.lookupError = error;
         Serial.print("Spoolman lookup failed: ");
         Serial.println(error);
+        persistStation(stationId, station);
     }
 
     drawDisplay();
@@ -566,6 +607,10 @@ void setup() {
     dryerConfig.begin();
     configureSpoolman();
 
+    if (sessionStore.begin()) {
+        restoreSessions();
+    }
+
     pinMode(PIN_BUTTON_TOP, INPUT_PULLUP);
     pinMode(PIN_BUTTON_BOTTOM, INPUT_PULLUP);
 
@@ -598,8 +643,8 @@ void loop() {
 
     unsigned long now = millis();
 
-    updateStationSession(topStation, "TOP", now);
-    updateStationSession(bottomStation, "BOTTOM", now);
+    updateStationSession(DryerStation::TOP, topStation, "TOP", now);
+    updateStationSession(DryerStation::BOTTOM, bottomStation, "BOTTOM", now);
 
     if ((now - lastTemperatureRead) >= 2000) {
         lastTemperatureRead = now;
