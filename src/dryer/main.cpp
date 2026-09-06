@@ -22,9 +22,6 @@ constexpr uint8_t PIN_TEMP = 27;
 constexpr uint8_t PIN_BUTTON_SELECT = 32;
 constexpr uint8_t PIN_BUTTON_CLEAR = 33;
 
-// Actual NodeMCU-32S silkscreen labels:
-//   OLED SDA -> P21 (GPIO21) -- NOT the nearby RX pin
-//   OLED SCL -> P22 (GPIO22) -- NOT the nearby TX pin
 constexpr uint8_t OLED_SDA = 21;
 constexpr uint8_t OLED_SCL = 22;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
@@ -35,10 +32,6 @@ constexpr uint8_t PN532_MOSI = 23;
 constexpr uint8_t PN532_CS   = 25;
 
 // ---------- Hardware backends ----------
-//
-// Application code below talks only to DryerDisplayI / DryerNfcI. Additional
-// SpoolSense-supported displays and NFC readers can be added as backends without
-// changing the dryer session logic.
 
 SSD1306DryerDisplay ssd1306Display(OLED_SDA, OLED_SCL, OLED_ADDRESS);
 DryerDisplayI* activeDisplay = &ssd1306Display;
@@ -51,6 +44,7 @@ bool nfcAvailable = false;
 
 OneWire oneWire(PIN_TEMP);
 DallasTemperature temperatureSensor(&oneWire);
+float chamberTempsC[DRYER_ZONE_COUNT];
 
 // ---------- Connectivity / persistence ----------
 
@@ -65,17 +59,9 @@ bool wifiConnected = false;
 
 // ---------- Dryer state ----------
 
-// A single-spool dryer uses the lower station, so BOTTOM is the natural
-// power-on/default target. SELECT cycles the available stations; CLEAR removes
-// the currently selected spool assignment.
-DryerStation selectedStation = DryerStation::BOTTOM;
-DryerStationState topStation;
-DryerStationState bottomStation;
-
-// Current hardware is one thermal zone shared by both spool stations. The
-// planner accepts an arbitrary number of profiles so it can survive the later
-// station/zone-count refactor without changing its math.
-DryerTemperaturePlan temperaturePlan;
+DryerStationId selectedStation = DRYER_DEFAULT_STATION;
+DryerStationState stations[DRYER_STATION_COUNT];
+DryerTemperaturePlan temperaturePlans[DRYER_ZONE_COUNT];
 
 // ---------- Buttons ----------
 
@@ -94,7 +80,6 @@ DebouncedButton clearButton{PIN_BUTTON_CLEAR};
 // ---------- Timing ----------
 
 unsigned long lastTemperatureRead = 0;
-float chamberTempC = DEVICE_DISCONNECTED_C;
 
 String lastSeenUid;
 unsigned long lastTagSeenMs = 0;
@@ -107,14 +92,20 @@ constexpr unsigned long SESSION_PERSIST_INTERVAL_MS = 60000UL;
 
 DryerRuntimeStatus getRuntimeStatus();
 void drawDisplay();
-void recalculateTemperaturePlan();
+void recalculateTemperaturePlans();
+void clearRuntimeStation(DryerStationId station);
 
 // ---------- Helpers ----------
 
-bool chamberTemperatureValid() {
-    return chamberTempC != DEVICE_DISCONNECTED_C &&
-           chamberTempC >= -55.0f &&
-           chamberTempC <= 125.0f;
+bool chamberTemperatureValid(DryerZoneId zone) {
+    if (zone >= DRYER_ZONE_COUNT) {
+        return false;
+    }
+
+    float temperature = chamberTempsC[zone];
+    return temperature != DEVICE_DISCONNECTED_C &&
+           temperature >= -55.0f &&
+           temperature <= 125.0f;
 }
 
 String uidToString(const uint8_t* uid, uint8_t uidLength) {
@@ -132,9 +123,7 @@ String uidToString(const uint8_t* uid, uint8_t uidLength) {
 }
 
 DryerStationState& getSelectedStation() {
-    return selectedStation == DryerStation::TOP
-        ? topStation
-        : bottomStation;
+    return stations[selectedStation];
 }
 
 const char* sessionStateText(DryingSessionState state) {
@@ -151,29 +140,30 @@ const char* sessionStateText(DryingSessionState state) {
     }
 }
 
-void persistStation(DryerStation station, DryerStationState& state) {
+void persistStation(DryerStationId station, DryerStationState& state) {
     if (sessionStore.save(station, state)) {
         state.lastPersistMs = millis();
     }
 }
 
-uint8_t occupiedStationCount() {
+uint8_t occupiedStationCount(DryerZoneId zone) {
     uint8_t count = 0;
-    if (topStation.occupied) {
-        ++count;
-    }
-    if (bottomStation.occupied) {
-        ++count;
+    for (DryerStationId i = 0; i < DRYER_STATION_COUNT; ++i) {
+        if (dryerZoneForStation(i) == zone && stations[i].occupied) {
+            ++count;
+        }
     }
     return count;
 }
 
-bool temperaturePlanBlocksNewStarts() {
-    return occupiedStationCount() > 1 && !temperaturePlan.automaticPlanUsable;
+bool temperaturePlanBlocksNewStarts(DryerStationId station) {
+    DryerZoneId zone = dryerZoneForStation(station);
+    return occupiedStationCount(zone) > 1 &&
+           !temperaturePlans[zone].automaticPlanUsable;
 }
 
 void updateWaitingThreshold(
-    DryerStation station,
+    DryerStationId station,
     DryerStationState& state,
     int thresholdC
 ) {
@@ -188,131 +178,123 @@ void updateWaitingThreshold(
     persistStation(station, state);
 }
 
-void printTemperaturePlan() {
-    Serial.print("Temperature plan: ");
-    Serial.println(DryerTemperaturePlanner::stateText(temperaturePlan.state));
+void printTemperaturePlan(DryerZoneId zone) {
+    const DryerTemperaturePlan& plan = temperaturePlans[zone];
 
-    if (temperaturePlan.spoolCount == 0) {
+    Serial.print(dryerZoneLabel(zone));
+    Serial.print(" temperature plan: ");
+    Serial.println(DryerTemperaturePlanner::stateText(plan.state));
+
+    if (plan.spoolCount == 0) {
         return;
     }
 
-    if (temperaturePlan.automaticPlanUsable) {
+    if (plan.automaticPlanUsable) {
         Serial.print("  Shared target: ");
-        Serial.print(temperaturePlan.recommendedTargetC);
+        Serial.print(plan.recommendedTargetC);
         Serial.println(" C");
-
         Serial.print("  Shared range: ");
-        Serial.print(temperaturePlan.commonMinC);
+        Serial.print(plan.commonMinC);
         Serial.print("-");
-        Serial.print(temperaturePlan.commonMaxC);
+        Serial.print(plan.commonMaxC);
         Serial.println(" C");
         return;
     }
 
-    if (temperaturePlan.state == DryerTemperaturePlanState::COMPROMISE_REQUIRED) {
+    if (plan.state == DryerTemperaturePlanState::COMPROMISE_REQUIRED) {
         Serial.println("  WARNING: loaded drying ranges do not overlap.");
-        Serial.print("  Lowest required minimum: ");
-        Serial.print(temperaturePlan.commonMinC);
-        Serial.println(" C");
-        Serial.print("  Highest universally non-overtemperature candidate: ");
-        Serial.print(temperaturePlan.recommendedTargetC);
+        Serial.print("  Highest non-overtemperature candidate: ");
+        Serial.print(plan.recommendedTargetC);
         Serial.println(" C");
         Serial.print("  Range gap: ");
-        Serial.print(temperaturePlan.compromiseGapC);
+        Serial.print(plan.compromiseGapC);
         Serial.println(" C");
-        Serial.println("  Automatic compromise is disabled until time compensation is validated.");
-    } else if (temperaturePlan.state == DryerTemperaturePlanState::INVALID_PROFILE) {
+        Serial.println("  Automatic compromise remains disabled until time compensation is validated.");
+    } else if (plan.state == DryerTemperaturePlanState::INVALID_PROFILE) {
         Serial.println("  WARNING: a loaded spool is missing a usable drying profile.");
     }
 }
 
-void recalculateTemperaturePlan() {
-    // An occupied station whose spool cannot be resolved is intentionally a
-    // blocker. We cannot safely recommend a shared chamber temperature when one
-    // loaded filament's limits are unknown.
-    bool unresolvedLoadedSpool =
-        (topStation.occupied && !topStation.spool.found) ||
-        (bottomStation.occupied && !bottomStation.spool.found);
+void recalculateTemperaturePlans() {
+    for (DryerZoneId zone = 0; zone < DRYER_ZONE_COUNT; ++zone) {
+        const DryerSpoolInfo* profiles[DRYER_STATION_COUNT] = {};
+        size_t profileCount = 0;
+        bool unresolvedLoadedSpool = false;
 
-    const DryerSpoolInfo* profiles[2] = {
-        topStation.occupied ? &topStation.spool : nullptr,
-        bottomStation.occupied ? &bottomStation.spool : nullptr
-    };
+        for (DryerStationId station = 0; station < DRYER_STATION_COUNT; ++station) {
+            if (dryerZoneForStation(station) != zone || !stations[station].occupied) {
+                continue;
+            }
 
-    temperaturePlan = DryerTemperaturePlanner::calculate(profiles, 2);
+            if (!stations[station].spool.found) {
+                unresolvedLoadedSpool = true;
+            }
 
-    if (unresolvedLoadedSpool) {
-        temperaturePlan.state = DryerTemperaturePlanState::INVALID_PROFILE;
-        temperaturePlan.automaticPlanUsable = false;
+            profiles[profileCount++] = &stations[station].spool;
+        }
+
+        temperaturePlans[zone] =
+            DryerTemperaturePlanner::calculate(profiles, profileCount);
+
+        if (unresolvedLoadedSpool) {
+            temperaturePlans[zone].state = DryerTemperaturePlanState::INVALID_PROFILE;
+            temperaturePlans[zone].automaticPlanUsable = false;
+        }
+
+        printTemperaturePlan(zone);
+
+        const DryerTemperaturePlan& plan = temperaturePlans[zone];
+        if (!plan.automaticPlanUsable || plan.recommendedTargetC <= 0) {
+            continue;
+        }
+
+        int sharedThresholdC = plan.recommendedTargetC - SESSION_START_OFFSET_C;
+        if (sharedThresholdC < 0) {
+            sharedThresholdC = 0;
+        }
+
+        for (DryerStationId station = 0; station < DRYER_STATION_COUNT; ++station) {
+            if (dryerZoneForStation(station) == zone) {
+                updateWaitingThreshold(station, stations[station], sharedThresholdC);
+            }
+        }
     }
-
-    printTemperaturePlan();
-
-    if (!temperaturePlan.automaticPlanUsable ||
-        temperaturePlan.recommendedTargetC <= 0) {
-        return;
-    }
-
-    int sharedThresholdC =
-        temperaturePlan.recommendedTargetC - SESSION_START_OFFSET_C;
-    if (sharedThresholdC < 0) {
-        sharedThresholdC = 0;
-    }
-
-    // A newly loaded or cleared spool can change the shared target at any time.
-    // Waiting stations adopt the recalculated threshold immediately. Already-
-    // running sessions keep their original wall-clock deadline.
-    updateWaitingThreshold(
-        DryerStation::TOP,
-        topStation,
-        sharedThresholdC
-    );
-    updateWaitingThreshold(
-        DryerStation::BOTTOM,
-        bottomStation,
-        sharedThresholdC
-    );
 }
 
 void restoreSessions() {
-    if (sessionStore.load(DryerStation::TOP, topStation)) {
-        Serial.print("Restored TOP session: ");
-        Serial.print(sessionStateText(topStation.sessionState));
-        Serial.print(", remaining ");
-        Serial.print(topStation.remainingSeconds);
-        Serial.print(" s, finish epoch ");
-        Serial.println(topStation.finishEpoch);
-    }
+    for (DryerStationId station = 0; station < DRYER_STATION_COUNT; ++station) {
+        if (!sessionStore.load(station, stations[station])) {
+            continue;
+        }
 
-    if (sessionStore.load(DryerStation::BOTTOM, bottomStation)) {
-        Serial.print("Restored BOTTOM session: ");
-        Serial.print(sessionStateText(bottomStation.sessionState));
+        Serial.print("Restored ");
+        Serial.print(dryerStationLabel(station));
+        Serial.print(" session: ");
+        Serial.print(sessionStateText(stations[station].sessionState));
         Serial.print(", remaining ");
-        Serial.print(bottomStation.remainingSeconds);
+        Serial.print(stations[station].remainingSeconds);
         Serial.print(" s, finish epoch ");
-        Serial.println(bottomStation.finishEpoch);
+        Serial.println(stations[station].finishEpoch);
     }
 }
 
 void completeStationSession(
-    DryerStation station,
-    DryerStationState& state,
-    const char* stationName
+    DryerStationId station,
+    DryerStationState& state
 ) {
     state.remainingSeconds = 0;
     state.finishEpoch = 0;
     state.sessionState = DryingSessionState::COMPLETE;
 
-    Serial.print(stationName);
+    Serial.print(dryerStationLabel(station));
     Serial.println(" drying complete.");
     persistStation(station, state);
     drawDisplay();
 }
 
 void configureStationSession(
-    DryerStation station,
-    DryerStationState& state,
-    const char* stationName
+    DryerStationId station,
+    DryerStationState& state
 ) {
     state.sessionState = DryingSessionState::INACTIVE;
     state.totalSeconds = 0;
@@ -324,7 +306,7 @@ void configureStationSession(
     if (!state.spool.found ||
         state.spool.dryTempC <= 0 ||
         state.spool.dryTimeHours <= 0) {
-        Serial.print(stationName);
+        Serial.print(dryerStationLabel(station));
         Serial.println(" drying session inactive: dry profile is incomplete.");
         persistStation(station, state);
         return;
@@ -339,7 +321,7 @@ void configureStationSession(
     }
     state.sessionState = DryingSessionState::WAITING_FOR_TEMP;
 
-    Serial.print(stationName);
+    Serial.print(dryerStationLabel(station));
     Serial.print(" session waiting for ");
     Serial.print(state.startThresholdC);
     Serial.print(" C; duration ");
@@ -350,23 +332,20 @@ void configureStationSession(
 }
 
 void updateStationSession(
-    DryerStation station,
+    DryerStationId station,
     DryerStationState& state,
-    const char* stationName,
     unsigned long now
 ) {
+    DryerZoneId zone = dryerZoneForStation(station);
+
     if (state.sessionState == DryingSessionState::WAITING_FOR_TEMP) {
-        if (temperaturePlanBlocksNewStarts()) {
+        if (temperaturePlanBlocksNewStarts(station)) {
             return;
         }
 
-        // Countdown begins once the chamber reaches target - 5 C. If the
-        // chamber is already hotter than the newly recommended shared target,
-        // that still counts as drying time; the display tells the operator to
-        // reduce the manual dryer's setpoint while the timer continues.
         if (
-            chamberTemperatureValid() &&
-            chamberTempC >= static_cast<float>(state.startThresholdC)
+            chamberTemperatureValid(zone) &&
+            chamberTempsC[zone] >= static_cast<float>(state.startThresholdC)
         ) {
             state.sessionState = DryingSessionState::DRYING;
             state.lastSessionTickMs = now;
@@ -378,9 +357,9 @@ void updateStationSession(
                 state.finishEpoch = 0;
             }
 
-            Serial.print(stationName);
+            Serial.print(dryerStationLabel(station));
             Serial.print(" drying started at chamber temperature ");
-            Serial.print(chamberTempC, 2);
+            Serial.print(chamberTempsC[zone], 2);
             Serial.print(" C");
             if (state.finishEpoch > 0) {
                 Serial.print("; finish epoch ");
@@ -399,27 +378,23 @@ void updateStationSession(
     }
 
     if (state.remainingSeconds == 0) {
-        completeStationSession(station, state, stationName);
+        completeStationSession(station, state);
         return;
     }
 
-    // Preferred path: absolute UTC deadline. This lets the ESP32 reconstruct
-    // remaining time after a reboot or controller-only power outage.
     if (timeService.isSynced()) {
         uint32_t epochNow = timeService.nowEpoch();
 
-        // Sessions created before NTP was available (or before the wall-clock
-        // persistence upgrade) are migrated in-place without losing progress.
         if (state.finishEpoch == 0) {
             state.finishEpoch = epochNow + state.remainingSeconds;
-            Serial.print(stationName);
+            Serial.print(dryerStationLabel(station));
             Serial.print(" session adopted wall-clock deadline ");
             Serial.println(state.finishEpoch);
             persistStation(station, state);
         }
 
         if (epochNow >= state.finishEpoch) {
-            completeStationSession(station, state, stationName);
+            completeStationSession(station, state);
             return;
         }
 
@@ -432,8 +407,6 @@ void updateStationSession(
         return;
     }
 
-    // Fallback while SNTP is unavailable. Once wall-clock time becomes valid,
-    // the session automatically switches to the absolute deadline path above.
     unsigned long elapsedMs = now - state.lastSessionTickMs;
     if (elapsedMs < 1000UL) {
         return;
@@ -443,7 +416,7 @@ void updateStationSession(
     state.lastSessionTickMs += elapsedSeconds * 1000UL;
 
     if (elapsedSeconds >= state.remainingSeconds) {
-        completeStationSession(station, state, stationName);
+        completeStationSession(station, state);
         return;
     }
 
@@ -454,8 +427,14 @@ void updateStationSession(
     }
 }
 
-DryerStationView makeRuntimeStationView(const DryerStationState& state) {
+DryerStationView makeRuntimeStationView(
+    DryerStationId station,
+    const DryerStationState& state
+) {
     DryerStationView view;
+    view.id = station;
+    view.zone = dryerZoneForStation(station);
+    view.label = dryerStationLabel(station);
     view.occupied = state.occupied;
     view.uid = state.uid;
     view.spool = state.spool;
@@ -468,8 +447,6 @@ DryerStationView makeRuntimeStationView(const DryerStationState& state) {
 
 DryerRuntimeStatus getRuntimeStatus() {
     DryerRuntimeStatus status;
-    status.chamberTempC = chamberTempC;
-    status.temperatureValid = chamberTemperatureValid();
     status.wifiConnected = wifiConnected;
     if (wifiConnected) {
         status.ipAddress = WiFi.localIP().toString();
@@ -477,22 +454,29 @@ DryerRuntimeStatus getRuntimeStatus() {
     status.spoolmanConfigured = dryerConfig.hasSpoolman();
     status.nfcAvailable = nfcAvailable;
     status.setupPortalActive = setupPortal.isActive();
-
-    status.temperaturePlan.state = temperaturePlan.state;
-    status.temperaturePlan.status =
-        DryerTemperaturePlanner::stateText(temperaturePlan.state);
-    status.temperaturePlan.spoolCount = temperaturePlan.spoolCount;
-    status.temperaturePlan.commonMinC = temperaturePlan.commonMinC;
-    status.temperaturePlan.commonMaxC = temperaturePlan.commonMaxC;
-    status.temperaturePlan.recommendedTargetC =
-        temperaturePlan.recommendedTargetC;
-    status.temperaturePlan.compromiseGapC = temperaturePlan.compromiseGapC;
-    status.temperaturePlan.automaticPlanUsable =
-        temperaturePlan.automaticPlanUsable;
-
     status.selectedStation = selectedStation;
-    status.top = makeRuntimeStationView(topStation);
-    status.bottom = makeRuntimeStationView(bottomStation);
+
+    for (DryerZoneId zone = 0; zone < DRYER_ZONE_COUNT; ++zone) {
+        DryerZoneView& view = status.zones[zone];
+        const DryerTemperaturePlan& plan = temperaturePlans[zone];
+        view.id = zone;
+        view.label = dryerZoneLabel(zone);
+        view.chamberTempC = chamberTempsC[zone];
+        view.temperatureValid = chamberTemperatureValid(zone);
+        view.temperaturePlan.state = plan.state;
+        view.temperaturePlan.status = DryerTemperaturePlanner::stateText(plan.state);
+        view.temperaturePlan.spoolCount = plan.spoolCount;
+        view.temperaturePlan.commonMinC = plan.commonMinC;
+        view.temperaturePlan.commonMaxC = plan.commonMaxC;
+        view.temperaturePlan.recommendedTargetC = plan.recommendedTargetC;
+        view.temperaturePlan.compromiseGapC = plan.compromiseGapC;
+        view.temperaturePlan.automaticPlanUsable = plan.automaticPlanUsable;
+    }
+
+    for (DryerStationId station = 0; station < DRYER_STATION_COUNT; ++station) {
+        status.stations[station] = makeRuntimeStationView(station, stations[station]);
+    }
+
     return status;
 }
 
@@ -502,22 +486,21 @@ void drawDisplay() {
     }
 }
 
-void clearRuntimeStation(bool top) {
-    DryerStation stationId = top ? DryerStation::TOP : DryerStation::BOTTOM;
-    DryerStationState& station = top ? topStation : bottomStation;
-    station = DryerStationState{};
-    sessionStore.clear(stationId);
+void clearRuntimeStation(DryerStationId station) {
+    if (station >= DRYER_STATION_COUNT) {
+        return;
+    }
 
-    // Allow the same tag to be rescanned immediately after a manual clear.
+    stations[station] = DryerStationState{};
+    sessionStore.clear(station);
+
     lastSeenUid = "";
     lastTagSeenMs = 0;
 
     Serial.print("Cleared station: ");
-    Serial.println(top ? "TOP" : "BOTTOM");
+    Serial.println(dryerStationLabel(station));
 
-    // Removing a spool changes the set of profiles sharing this thermal zone,
-    // so the recommended common temperature must be recalculated immediately.
-    recalculateTemperaturePlan();
+    recalculateTemperaturePlans();
     drawDisplay();
 }
 
@@ -563,12 +546,9 @@ void printSpoolDetails(const DryerSpoolInfo& spool) {
 }
 
 void assignUidToSelectedStation(const String& uid) {
+    DryerStationId stationId = selectedStation;
     DryerStationState& station = getSelectedStation();
-    const DryerStation stationId = selectedStation;
-    const char* stationName =
-        selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM";
 
-    // A new scan replaces the prior station assignment and session.
     station = DryerStationState{};
     station.occupied = true;
     station.uid = uid;
@@ -577,7 +557,7 @@ void assignUidToSelectedStation(const String& uid) {
     Serial.print("Assigned UID ");
     Serial.print(uid);
     Serial.print(" to ");
-    Serial.println(stationName);
+    Serial.println(dryerStationLabel(stationId));
 
     drawDisplay();
 
@@ -585,7 +565,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.lookupError = "WiFi offline";
         Serial.println("Spoolman lookup skipped: WiFi offline.");
         persistStation(stationId, station);
-        recalculateTemperaturePlan();
+        recalculateTemperaturePlans();
         drawDisplay();
         return;
     }
@@ -594,7 +574,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.lookupError = "Spoolman not configured";
         Serial.println("Spoolman lookup skipped: URL not configured.");
         persistStation(stationId, station);
-        recalculateTemperaturePlan();
+        recalculateTemperaturePlans();
         drawDisplay();
         return;
     }
@@ -609,7 +589,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.spool = spoolInfo;
         station.lookupError = "";
         printSpoolDetails(station.spool);
-        configureStationSession(stationId, station, stationName);
+        configureStationSession(stationId, station);
     } else {
         station.lookupError = error;
         Serial.print("Spoolman lookup failed: ");
@@ -617,7 +597,7 @@ void assignUidToSelectedStation(const String& uid) {
         persistStation(stationId, station);
     }
 
-    recalculateTemperaturePlan();
+    recalculateTemperaturePlans();
     drawDisplay();
 }
 
@@ -663,7 +643,6 @@ bool connectWiFi() {
     Serial.print("WiFi hostname: ");
     Serial.println(hostname);
 
-    // Known-good SpoolSense DHCP hostname startup order.
     WiFi.mode(WIFI_MODE_NULL);
     delay(100);
     WiFi.setHostname(hostname.c_str());
@@ -754,19 +733,17 @@ void handleButtons() {
     unsigned long now = millis();
 
     if (buttonPressed(selectButton, now)) {
-        // Current prototype has two stations. This becomes index =
-        // (index + 1) % stationCount when variable station counts land.
-        selectedStation = selectedStation == DryerStation::BOTTOM
-            ? DryerStation::TOP
-            : DryerStation::BOTTOM;
+        selectedStation = static_cast<DryerStationId>(
+            (selectedStation + 1U) % DRYER_STATION_COUNT
+        );
 
         Serial.print("Selected station: ");
-        Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
+        Serial.println(dryerStationLabel(selectedStation));
         drawDisplay();
     }
 
     if (buttonPressed(clearButton, now)) {
-        clearRuntimeStation(selectedStation == DryerStation::TOP);
+        clearRuntimeStation(selectedStation);
     }
 }
 
@@ -823,16 +800,25 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
+    for (DryerZoneId zone = 0; zone < DRYER_ZONE_COUNT; ++zone) {
+        chamberTempsC[zone] = DEVICE_DISCONNECTED_C;
+    }
+
     Serial.println();
     Serial.println("SpoolSense Dryer");
     Serial.println("Firmware " FIRMWARE_VERSION);
+    Serial.print("Build shape: ");
+    Serial.print(DRYER_STATION_COUNT);
+    Serial.print(" station(s), ");
+    Serial.print(DRYER_ZONE_COUNT);
+    Serial.println(" thermal zone(s)");
 
     dryerConfig.begin();
     configureSpoolman();
 
     if (sessionStore.begin()) {
         restoreSessions();
-        recalculateTemperaturePlan();
+        recalculateTemperaturePlans();
     }
 
     pinMode(PIN_BUTTON_SELECT, INPUT_PULLUP);
@@ -841,8 +827,12 @@ void setup() {
     temperatureSensor.begin();
     initDisplay();
 
+    uint8_t sensorCount = temperatureSensor.getDeviceCount();
     Serial.print("DS18B20 devices found: ");
-    Serial.println(temperatureSensor.getDeviceCount());
+    Serial.println(sensorCount);
+    if (sensorCount < DRYER_ZONE_COUNT) {
+        Serial.println("WARNING: fewer temperature probes than configured thermal zones.");
+    }
 
     initNfc();
     drawDisplay();
@@ -869,22 +859,31 @@ void loop() {
 
     unsigned long now = millis();
 
-    updateStationSession(DryerStation::TOP, topStation, "TOP", now);
-    updateStationSession(DryerStation::BOTTOM, bottomStation, "BOTTOM", now);
+    for (DryerStationId station = 0; station < DRYER_STATION_COUNT; ++station) {
+        updateStationSession(station, stations[station], now);
+    }
 
     if ((now - lastTemperatureRead) >= 2000) {
         lastTemperatureRead = now;
 
         temperatureSensor.requestTemperatures();
-        chamberTempC = temperatureSensor.getTempCByIndex(0);
+        for (DryerZoneId zone = 0; zone < DRYER_ZONE_COUNT; ++zone) {
+            chamberTempsC[zone] = temperatureSensor.getTempCByIndex(zone);
+
+            if (DRYER_ZONE_COUNT == 1) {
+                Serial.print("Chamber temperature: ");
+            } else {
+                Serial.print("Zone ");
+                Serial.print(zone + 1);
+                Serial.print(" temperature: ");
+            }
+            Serial.print(chamberTempsC[zone]);
+            Serial.println(" C");
+        }
 
         if (!setupPortal.isActive()) {
             wifiConnected = WiFi.status() == WL_CONNECTED;
         }
-
-        Serial.print("Chamber temperature: ");
-        Serial.print(chamberTempC);
-        Serial.println(" C");
 
         drawDisplay();
     }
