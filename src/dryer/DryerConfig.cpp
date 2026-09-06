@@ -8,6 +8,11 @@ bool DryerConfig::begin() {
     ssid_ = "";
     password_ = "";
     spoolmanUrl_ = "";
+    haEnabled_ = false;
+    mqttHost_ = "";
+    mqttPort_ = 1883;
+    mqttUser_ = "";
+    mqttPassword_ = "";
 
     Preferences prefs;
 
@@ -22,6 +27,12 @@ bool DryerConfig::begin() {
     password_ = prefs.getString("wifi_pass", "");
     spoolmanUrl_ = prefs.getString("spoolman", "");
 
+    haEnabled_ = prefs.getBool("ha_en", false);
+    mqttHost_ = prefs.getString("mqtt_host", "");
+    mqttPort_ = prefs.getUShort("mqtt_port", 1883);
+    mqttUser_ = prefs.getString("mqtt_user", "");
+    mqttPassword_ = prefs.getString("mqtt_pass", "");
+
     prefs.end();
 
     Serial.print("DryerConfig: WiFi configured: ");
@@ -29,6 +40,9 @@ bool DryerConfig::begin() {
 
     Serial.print("DryerConfig: Spoolman configured: ");
     Serial.println(hasSpoolman() ? "yes" : "no");
+
+    Serial.print("DryerConfig: Home Assistant configured: ");
+    Serial.println(hasHomeAssistant() ? "yes" : "no");
 
     return true;
 }
@@ -41,6 +55,10 @@ bool DryerConfig::hasSpoolman() const {
     return !spoolmanUrl_.isEmpty();
 }
 
+bool DryerConfig::hasHomeAssistant() const {
+    return haEnabled_ && !mqttHost_.isEmpty() && mqttPort_ > 0;
+}
+
 const char* DryerConfig::getSSID() const {
     return ssid_.c_str();
 }
@@ -51,6 +69,26 @@ const char* DryerConfig::getPassword() const {
 
 const char* DryerConfig::getSpoolmanURL() const {
     return spoolmanUrl_.c_str();
+}
+
+bool DryerConfig::getHAEnabled() const {
+    return haEnabled_;
+}
+
+const char* DryerConfig::getHAMqttHost() const {
+    return mqttHost_.c_str();
+}
+
+uint16_t DryerConfig::getHAMqttPort() const {
+    return mqttPort_;
+}
+
+const char* DryerConfig::getHAMqttUser() const {
+    return mqttUser_.c_str();
+}
+
+const char* DryerConfig::getHAMqttPassword() const {
+    return mqttPassword_.c_str();
 }
 
 bool DryerConfig::save(
@@ -91,6 +129,47 @@ bool DryerConfig::save(
     return true;
 }
 
+bool DryerConfig::saveHomeAssistant(
+    bool enabled,
+    const String& mqttHost,
+    uint16_t mqttPort,
+    const String& mqttUser,
+    const String& mqttPassword
+) {
+    String cleanHost = mqttHost;
+    String cleanUser = mqttUser;
+    cleanHost.trim();
+    cleanUser.trim();
+
+    if (enabled && (cleanHost.isEmpty() || mqttPort == 0)) {
+        return false;
+    }
+
+    Preferences prefs;
+    if (!prefs.begin(NVS_NAMESPACE, false)) {
+        return false;
+    }
+
+    bool ok = true;
+    ok &= prefs.putBool("ha_en", enabled) > 0;
+    prefs.putString("mqtt_host", cleanHost);
+    ok &= prefs.putUShort("mqtt_port", mqttPort == 0 ? 1883 : mqttPort) > 0;
+    prefs.putString("mqtt_user", cleanUser);
+    prefs.putString("mqtt_pass", mqttPassword);
+    prefs.end();
+
+    if (!ok) {
+        return false;
+    }
+
+    haEnabled_ = enabled;
+    mqttHost_ = cleanHost;
+    mqttPort_ = mqttPort == 0 ? 1883 : mqttPort;
+    mqttUser_ = cleanUser;
+    mqttPassword_ = mqttPassword;
+    return true;
+}
+
 void DryerConfig::clear() {
     Preferences prefs;
 
@@ -102,4 +181,9 @@ void DryerConfig::clear() {
     ssid_ = "";
     password_ = "";
     spoolmanUrl_ = "";
+    haEnabled_ = false;
+    mqttHost_ = "";
+    mqttPort_ = 1883;
+    mqttUser_ = "";
+    mqttPassword_ = "";
 }
