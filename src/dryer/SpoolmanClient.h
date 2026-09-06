@@ -13,7 +13,15 @@ struct DryerSpoolInfo {
     String vendor;
     String material;
 
+    // Preferred/nominal drying temperature. Kept as dryTempC for backwards
+    // compatibility with the existing session code.
     int dryTempC = 0;
+
+    // Safe/recommended drying range. If Spoolman only provides a single
+    // temperature these collapse to dryTempC.
+    int dryTempMinC = 0;
+    int dryTempMaxC = 0;
+
     int dryTimeHours = 0;
 };
 
@@ -33,4 +41,13 @@ private:
 
     static String cleanExtraValue(const String& value);
     static int readExtraInt(JsonVariantConst value);
+    static uint8_t extractPositiveInts(
+        const String& text,
+        int* values,
+        uint8_t maxValues
+    );
+    static void readDryTemperatureProfile(
+        JsonObjectConst extra,
+        DryerSpoolInfo& spool
+    );
 };
