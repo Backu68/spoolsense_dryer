@@ -19,8 +19,7 @@
 // ---------- Board pins ----------
 
 constexpr uint8_t PIN_TEMP = 27;
-constexpr uint8_t PIN_BUTTON_TOP = 32;
-constexpr uint8_t PIN_BUTTON_BOTTOM = 33;
+constexpr uint8_t PIN_BUTTON_SELECT = 32;
 
 // Actual NodeMCU-32S silkscreen labels:
 //   OLED SDA -> P21 (GPIO21) -- NOT the nearby RX pin
@@ -66,7 +65,7 @@ bool wifiConnected = false;
 // ---------- Dryer state ----------
 
 // A single-spool dryer uses the lower station, so BOTTOM is the natural
-// power-on/default target. TOP remains available when the second station is used.
+// power-on/default target. The one selector button cycles through stations.
 DryerStation selectedStation = DryerStation::BOTTOM;
 DryerStationState topStation;
 DryerStationState bottomStation;
@@ -76,17 +75,13 @@ DryerStationState bottomStation;
 // station/zone-count refactor without changing its math.
 DryerTemperaturePlan temperaturePlan;
 
-// ---------- Buttons ----------
+// ---------- Button ----------
 
 constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
 
-bool lastTopReading = HIGH;
-bool lastBottomReading = HIGH;
-bool stableTopState = HIGH;
-bool stableBottomState = HIGH;
-
-unsigned long topDebounceTime = 0;
-unsigned long bottomDebounceTime = 0;
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
+unsigned long buttonDebounceTime = 0;
 
 // ---------- Timing ----------
 
@@ -256,8 +251,10 @@ void recalculateTemperaturePlan() {
         sharedThresholdC = 0;
     }
 
-    // If both spools are still waiting to begin, they should use the same
-    // chamber plan. Already-running sessions keep their original deadline.
+    // A newly loaded spool can change the shared target at any time. Waiting
+    // stations adopt that new target immediately. Already-running sessions keep
+    // their original wall-clock deadline because the new target is still inside
+    // their common valid drying range.
     updateWaitingThreshold(
         DryerStation::TOP,
         topStation,
@@ -356,9 +353,23 @@ void updateStationSession(
             return;
         }
 
+        // The lower bound preserves the locked target-5 C rule. The upper
+        // bound prevents a newly-added lower-temperature spool from starting
+        // immediately while the chamber is still sitting at the old hotter
+        // setpoint. It must first settle near the newly calculated target.
+        int activeTargetC = state.spool.dryTempC;
+        if (
+            temperaturePlan.automaticPlanUsable &&
+            temperaturePlan.recommendedTargetC > 0
+        ) {
+            activeTargetC = temperaturePlan.recommendedTargetC;
+        }
+        int upperStartC = activeTargetC + SESSION_START_OFFSET_C;
+
         if (
             chamberTemperatureValid() &&
-            chamberTempC >= static_cast<float>(state.startThresholdC)
+            chamberTempC >= static_cast<float>(state.startThresholdC) &&
+            chamberTempC <= static_cast<float>(upperStartC)
         ) {
             state.sessionState = DryingSessionState::DRYING;
             state.lastSessionTickMs = now;
@@ -717,47 +728,41 @@ void startRuntimeWebUI() {
     }
 }
 
-// ---------- Buttons ----------
+// ---------- Button ----------
 
 void handleButtons() {
     unsigned long now = millis();
+    bool reading = digitalRead(PIN_BUTTON_SELECT);
 
-    bool topReading = digitalRead(PIN_BUTTON_TOP);
-    bool bottomReading = digitalRead(PIN_BUTTON_BOTTOM);
-
-    if (topReading != lastTopReading) {
-        topDebounceTime = now;
-        lastTopReading = topReading;
+    if (reading != lastButtonReading) {
+        buttonDebounceTime = now;
+        lastButtonReading = reading;
     }
 
-    if ((now - topDebounceTime) >= BUTTON_DEBOUNCE_MS) {
-        if (topReading != stableTopState) {
-            stableTopState = topReading;
-
-            if (stableTopState == LOW) {
-                selectedStation = DryerStation::TOP;
-                Serial.println("Selected station: TOP");
-                drawDisplay();
-            }
-        }
+    if ((now - buttonDebounceTime) < BUTTON_DEBOUNCE_MS) {
+        return;
     }
 
-    if (bottomReading != lastBottomReading) {
-        bottomDebounceTime = now;
-        lastBottomReading = bottomReading;
+    if (reading == stableButtonState) {
+        return;
     }
 
-    if ((now - bottomDebounceTime) >= BUTTON_DEBOUNCE_MS) {
-        if (bottomReading != stableBottomState) {
-            stableBottomState = bottomReading;
+    stableButtonState = reading;
 
-            if (stableBottomState == LOW) {
-                selectedStation = DryerStation::BOTTOM;
-                Serial.println("Selected station: BOTTOM");
-                drawDisplay();
-            }
-        }
+    if (stableButtonState != LOW) {
+        return;
     }
+
+    // Current prototype has two stations. This becomes index = (index + 1) %
+    // stationCount when the variable-station refactor lands; the hardware stays
+    // one button regardless of how many shelves/stations are compiled in.
+    selectedStation = selectedStation == DryerStation::BOTTOM
+        ? DryerStation::TOP
+        : DryerStation::BOTTOM;
+
+    Serial.print("Selected station: ");
+    Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
+    drawDisplay();
 }
 
 // ---------- NFC ----------
@@ -825,8 +830,7 @@ void setup() {
         recalculateTemperaturePlan();
     }
 
-    pinMode(PIN_BUTTON_TOP, INPUT_PULLUP);
-    pinMode(PIN_BUTTON_BOTTOM, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_SELECT, INPUT_PULLUP);
 
     temperatureSensor.begin();
     initDisplay();
