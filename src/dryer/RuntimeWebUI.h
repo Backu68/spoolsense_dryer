@@ -10,6 +10,10 @@ struct RuntimeStationView {
     String uid;
     DryerSpoolInfo spool;
     String lookupError;
+
+    String sessionStatus;
+    uint32_t remainingSeconds = 0;
+    int startThresholdC = 0;
 };
 
 struct RuntimeStatus {
@@ -18,7 +22,7 @@ struct RuntimeStatus {
     bool wifiConnected = false;
     bool spoolmanConfigured = false;
     bool nfcAvailable = false;
-    bool topSelected = true;
+    bool topSelected = false;
     RuntimeStationView top;
     RuntimeStationView bottom;
 };
