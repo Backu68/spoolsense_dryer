@@ -8,7 +8,7 @@
 class RuntimeWebUI {
 public:
     using StatusProvider = DryerRuntimeStatus (*)();
-    using ClearHandler = void (*)(bool topStation);
+    using ClearHandler = void (*)(DryerStationId station);
 
     bool begin(StatusProvider statusProvider, ClearHandler clearHandler);
     void loop();
@@ -18,8 +18,6 @@ private:
     void handleRoot();
     void handleStatus();
     void handleClear();
-
-    static String htmlEscape(const String& value);
 
     WebServer server_{80};
     StatusProvider statusProvider_ = nullptr;
