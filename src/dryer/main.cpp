@@ -10,6 +10,7 @@
 
 #include "DryerConfig.h"
 #include "SetupPortal.h"
+#include "RuntimeWebUI.h"
 #include "SpoolmanClient.h"
 
 // ---------- Pins ----------
@@ -53,6 +54,7 @@ bool nfcAvailable = false;
 
 DryerConfig dryerConfig;
 SetupPortal setupPortal;
+RuntimeWebUI runtimeWebUI;
 SpoolmanClient spoolman;
 
 bool wifiConnected = false;
@@ -139,6 +141,28 @@ String getStationDisplayName(const StationState& state) {
     return state.uid;
 }
 
+RuntimeStationView makeRuntimeStationView(const StationState& state) {
+    RuntimeStationView view;
+    view.occupied = state.occupied;
+    view.uid = state.uid;
+    view.spool = state.spool;
+    view.lookupError = state.lookupError;
+    return view;
+}
+
+RuntimeStatus getRuntimeStatus() {
+    RuntimeStatus status;
+    status.chamberTempC = chamberTempC;
+    status.temperatureValid = chamberTempC != DEVICE_DISCONNECTED_C;
+    status.wifiConnected = wifiConnected;
+    status.spoolmanConfigured = dryerConfig.hasSpoolman();
+    status.nfcAvailable = nfcAvailable;
+    status.topSelected = selectedStation == DryerStation::TOP;
+    status.top = makeRuntimeStationView(topStation);
+    status.bottom = makeRuntimeStationView(bottomStation);
+    return status;
+}
+
 void drawStationLine(
     int y,
     const char* name,
@@ -198,6 +222,19 @@ void drawDisplay() {
     }
 
     display.display();
+}
+
+void clearRuntimeStation(bool top) {
+    StationState& station = top ? topStation : bottomStation;
+    station = StationState{};
+
+    // Allow the same tag to be rescanned immediately after a manual clear.
+    lastSeenUid = "";
+    lastTagSeenMs = 0;
+
+    Serial.print("Cleared station: ");
+    Serial.println(top ? "TOP" : "BOTTOM");
+    drawDisplay();
 }
 
 void printSpoolDetails(const DryerSpoolInfo& spool) {
@@ -396,6 +433,12 @@ void startSetupPortal() {
     Serial.println();
 }
 
+void startRuntimeWebUI() {
+    if (!runtimeWebUI.begin(getRuntimeStatus, clearRuntimeStation)) {
+        Serial.println("RuntimeWebUI: failed to start.");
+    }
+}
+
 // ---------- Buttons ----------
 
 void handleButtons() {
@@ -528,6 +571,8 @@ void setup() {
 
     if (!connectWiFi()) {
         startSetupPortal();
+    } else {
+        startRuntimeWebUI();
     }
 
     Serial.println("Dryer controller booted.");
@@ -538,6 +583,7 @@ void setup() {
 
 void loop() {
     setupPortal.loop();
+    runtimeWebUI.loop();
     handleButtons();
     handleNfc();
 
