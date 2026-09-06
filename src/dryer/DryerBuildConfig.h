@@ -37,10 +37,13 @@ using DryerZoneId = uint8_t;
 constexpr bool DRYER_IS_HORIZONTAL =
     DRYER_LAYOUT == DRYER_LAYOUT_HORIZONTAL;
 
-// The retrofit's removable TOP shelf made BOTTOM the sensible default. A
-// horizontal dryer instead starts on BAY 1 regardless of station count.
+// Horizontal dryers naturally begin at BAY 1. Vertical dryers naturally begin
+// at the lowest physical shelf, preserving the retrofit's BOTTOM-first behavior
+// for any number of stacked levels.
 constexpr DryerStationId DRYER_DEFAULT_STATION =
-    (!DRYER_IS_HORIZONTAL && DRYER_STATION_COUNT == 2) ? 1 : 0;
+    DRYER_IS_HORIZONTAL
+        ? static_cast<DryerStationId>(0)
+        : static_cast<DryerStationId>(DRYER_STATION_COUNT - 1);
 
 inline DryerZoneId dryerZoneForStation(DryerStationId station) {
     // Default mapping keeps adjacent stations together. Examples:
@@ -58,12 +61,25 @@ inline String dryerStationLabel(DryerStationId station) {
         return "BAY " + String(static_cast<unsigned int>(station) + 1U);
     }
 
-    // Preserve the current retrofit labels for the two-level vertical dryer.
-    if (DRYER_STATION_COUNT == 2) {
-        return station == 0 ? "TOP" : "BOTTOM";
+    if (DRYER_STATION_COUNT == 1) {
+        return "SHELF";
     }
 
-    return "SHELF " + String(static_cast<unsigned int>(station) + 1U);
+    if (station == 0) {
+        return "TOP";
+    }
+
+    if (station == DRYER_STATION_COUNT - 1) {
+        return "BOTTOM";
+    }
+
+    // Three levels read TOP / MIDDLE / BOTTOM. Four or more levels retain clear
+    // physical ordering without pretending there is only one middle position.
+    if (DRYER_STATION_COUNT == 3) {
+        return "MIDDLE";
+    }
+
+    return "MID " + String(static_cast<unsigned int>(station));
 }
 
 inline String dryerZoneLabel(DryerZoneId zone) {
