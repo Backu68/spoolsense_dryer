@@ -143,7 +143,7 @@ async function refresh(){
   try{
     const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();
     el('temp').textContent=s.temperature_valid?s.temperature_c.toFixed(2)+DEG_C:'--.-'+DEG_C;
-    setHealth('wifi',s.wifi_connected,'Connected','Offline');
+    setHealth('wifi',s.wifi_connected,s.ip_address||'Connected','Offline');
     setHealth('spoolman',s.spoolman_configured,'Configured','Not configured');
     setHealth('nfc',s.nfc_available,'Ready','Unavailable');
     updateStation('top',s.top,s.selected==='top');
@@ -163,17 +163,18 @@ refresh();setInterval(refresh,1000);
 }
 
 void RuntimeWebUI::handleStatus() {
-    RuntimeStatus status = statusProvider_();
+    DryerRuntimeStatus status = statusProvider_();
 
     JsonDocument doc;
     doc["temperature_valid"] = status.temperatureValid;
     doc["temperature_c"] = status.chamberTempC;
     doc["wifi_connected"] = status.wifiConnected;
+    doc["ip_address"] = status.ipAddress;
     doc["spoolman_configured"] = status.spoolmanConfigured;
     doc["nfc_available"] = status.nfcAvailable;
-    doc["selected"] = status.topSelected ? "top" : "bottom";
+    doc["selected"] = status.selectedStation == DryerStation::TOP ? "top" : "bottom";
 
-    auto addStation = [](JsonObject target, const RuntimeStationView& station) {
+    auto addStation = [](JsonObject target, const DryerStationView& station) {
         target["occupied"] = station.occupied;
         target["uid"] = station.uid;
         target["lookup_error"] = station.lookupError;
