@@ -58,16 +58,12 @@ bool DryerSessionStore::load(DryerStation station, DryerStationState& state) {
     state.totalSeconds = prefs_.getUInt(key(station, "total").c_str(), 0);
     state.remainingSeconds = prefs_.getUInt(key(station, "remain").c_str(), 0);
     state.startThresholdC = prefs_.getInt(key(station, "thresh").c_str(), 0);
+    state.finishEpoch = prefs_.getUInt(key(station, "finish").c_str(), 0);
 
-    // A reboot/power interruption pauses the drying clock. If the station was
-    // actively drying, resume from the saved remaining time only after the
-    // chamber reaches the start threshold again.
-    if (state.sessionState == DryingSessionState::DRYING &&
-        state.remainingSeconds > 0) {
-        state.sessionState = DryingSessionState::WAITING_FOR_TEMP;
-    }
-
-    state.lastSessionTickMs = 0;
+    // Do not force an interrupted DRYING session back to WAITING. When a
+    // persisted finishEpoch is present, wall-clock reconciliation after NTP
+    // synchronization accounts for time that elapsed while the ESP32 was down.
+    state.lastSessionTickMs = millis();
     state.lastPersistMs = millis();
     return true;
 }
@@ -94,7 +90,12 @@ bool DryerSessionStore::save(
     if (existingRecord &&
         (state.sessionState == DryingSessionState::DRYING ||
          state.sessionState == DryingSessionState::COMPLETE)) {
-        return checkpoint(station, state.sessionState, state.remainingSeconds);
+        return checkpoint(
+            station,
+            state.sessionState,
+            state.remainingSeconds,
+            state.finishEpoch
+        );
     }
 
     bool ok = true;
@@ -118,6 +119,7 @@ bool DryerSessionStore::save(
     prefs_.putUInt(key(station, "total").c_str(), state.totalSeconds);
     prefs_.putUInt(key(station, "remain").c_str(), state.remainingSeconds);
     prefs_.putInt(key(station, "thresh").c_str(), state.startThresholdC);
+    prefs_.putUInt(key(station, "finish").c_str(), state.finishEpoch);
 
     return ok;
 }
@@ -125,7 +127,8 @@ bool DryerSessionStore::save(
 bool DryerSessionStore::checkpoint(
     DryerStation station,
     DryingSessionState sessionState,
-    uint32_t remainingSeconds
+    uint32_t remainingSeconds,
+    uint32_t finishEpoch
 ) {
     if (!ready_) {
         return false;
@@ -136,6 +139,7 @@ bool DryerSessionStore::checkpoint(
         static_cast<uint8_t>(sessionState)
     );
     prefs_.putUInt(key(station, "remain").c_str(), remainingSeconds);
+    prefs_.putUInt(key(station, "finish").c_str(), finishEpoch);
     return true;
 }
 
@@ -146,7 +150,8 @@ bool DryerSessionStore::clear(DryerStation station) {
 
     const char* suffixes[] = {
         "occ", "uid", "err", "found", "sid", "fid", "name", "vend",
-        "mat", "dtemp", "dhrs", "state", "total", "remain", "thresh"
+        "mat", "dtemp", "dhrs", "state", "total", "remain", "thresh",
+        "finish"
     };
 
     for (const char* suffix : suffixes) {

@@ -18,6 +18,11 @@ struct DryerStationState {
     uint32_t remainingSeconds = 0;
     int startThresholdC = 0;
 
+    // Absolute UTC completion deadline while actively drying. Zero means the
+    // session is using the millis() fallback because wall-clock time is not yet
+    // synchronized.
+    uint32_t finishEpoch = 0;
+
     // Runtime-only timing. These values are intentionally not persisted.
     unsigned long lastSessionTickMs = 0;
     unsigned long lastPersistMs = 0;
@@ -34,7 +39,8 @@ public:
     bool checkpoint(
         DryerStation station,
         DryingSessionState sessionState,
-        uint32_t remainingSeconds
+        uint32_t remainingSeconds,
+        uint32_t finishEpoch
     );
     bool clear(DryerStation station);
 

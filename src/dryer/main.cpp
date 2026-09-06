@@ -8,6 +8,7 @@
 #include "DryerNfcI.h"
 #include "DryerRuntimeTypes.h"
 #include "DryerSessionStore.h"
+#include "DryerTimeService.h"
 #include "PN532DryerNfc.h"
 #include "RuntimeWebUI.h"
 #include "SSD1306DryerDisplay.h"
@@ -54,6 +55,7 @@ DallasTemperature temperatureSensor(&oneWire);
 
 DryerConfig dryerConfig;
 DryerSessionStore sessionStore;
+DryerTimeService timeService;
 SetupPortal setupPortal;
 RuntimeWebUI runtimeWebUI;
 SpoolmanClient spoolman;
@@ -151,11 +153,8 @@ void restoreSessions() {
         Serial.print(sessionStateText(topStation.sessionState));
         Serial.print(", remaining ");
         Serial.print(topStation.remainingSeconds);
-        Serial.println(" s.");
-
-        // load() intentionally converts an interrupted DRYING session back to
-        // WAITING_FOR_TEMP. Save that safe post-reboot state immediately.
-        persistStation(DryerStation::TOP, topStation);
+        Serial.print(" s, finish epoch ");
+        Serial.println(topStation.finishEpoch);
     }
 
     if (sessionStore.load(DryerStation::BOTTOM, bottomStation)) {
@@ -163,10 +162,24 @@ void restoreSessions() {
         Serial.print(sessionStateText(bottomStation.sessionState));
         Serial.print(", remaining ");
         Serial.print(bottomStation.remainingSeconds);
-        Serial.println(" s.");
-
-        persistStation(DryerStation::BOTTOM, bottomStation);
+        Serial.print(" s, finish epoch ");
+        Serial.println(bottomStation.finishEpoch);
     }
+}
+
+void completeStationSession(
+    DryerStation station,
+    DryerStationState& state,
+    const char* stationName
+) {
+    state.remainingSeconds = 0;
+    state.finishEpoch = 0;
+    state.sessionState = DryingSessionState::COMPLETE;
+
+    Serial.print(stationName);
+    Serial.println(" drying complete.");
+    persistStation(station, state);
+    drawDisplay();
 }
 
 void configureStationSession(
@@ -178,6 +191,7 @@ void configureStationSession(
     state.totalSeconds = 0;
     state.remainingSeconds = 0;
     state.startThresholdC = 0;
+    state.finishEpoch = 0;
     state.lastSessionTickMs = 0;
 
     if (!state.spool.found ||
@@ -222,10 +236,22 @@ void updateStationSession(
             state.sessionState = DryingSessionState::DRYING;
             state.lastSessionTickMs = now;
 
+            if (timeService.isSynced()) {
+                state.finishEpoch =
+                    timeService.nowEpoch() + state.remainingSeconds;
+            } else {
+                state.finishEpoch = 0;
+            }
+
             Serial.print(stationName);
             Serial.print(" drying started at chamber temperature ");
             Serial.print(chamberTempC, 2);
-            Serial.println(" C.");
+            Serial.print(" C");
+            if (state.finishEpoch > 0) {
+                Serial.print("; finish epoch ");
+                Serial.print(state.finishEpoch);
+            }
+            Serial.println(".");
 
             persistStation(station, state);
             drawDisplay();
@@ -237,6 +263,42 @@ void updateStationSession(
         return;
     }
 
+    if (state.remainingSeconds == 0) {
+        completeStationSession(station, state, stationName);
+        return;
+    }
+
+    // Preferred path: absolute UTC deadline. This lets the ESP32 reconstruct
+    // remaining time after a reboot or controller-only power outage.
+    if (timeService.isSynced()) {
+        uint32_t epochNow = timeService.nowEpoch();
+
+        // Sessions created before NTP was available (or before the wall-clock
+        // persistence upgrade) are migrated in-place without losing progress.
+        if (state.finishEpoch == 0) {
+            state.finishEpoch = epochNow + state.remainingSeconds;
+            Serial.print(stationName);
+            Serial.print(" session adopted wall-clock deadline ");
+            Serial.println(state.finishEpoch);
+            persistStation(station, state);
+        }
+
+        if (epochNow >= state.finishEpoch) {
+            completeStationSession(station, state, stationName);
+            return;
+        }
+
+        state.remainingSeconds = state.finishEpoch - epochNow;
+        state.lastSessionTickMs = now;
+
+        if ((now - state.lastPersistMs) >= SESSION_PERSIST_INTERVAL_MS) {
+            persistStation(station, state);
+        }
+        return;
+    }
+
+    // Fallback while SNTP is unavailable. Once wall-clock time becomes valid,
+    // the session automatically switches to the absolute deadline path above.
     unsigned long elapsedMs = now - state.lastSessionTickMs;
     if (elapsedMs < 1000UL) {
         return;
@@ -246,13 +308,7 @@ void updateStationSession(
     state.lastSessionTickMs += elapsedSeconds * 1000UL;
 
     if (elapsedSeconds >= state.remainingSeconds) {
-        state.remainingSeconds = 0;
-        state.sessionState = DryingSessionState::COMPLETE;
-
-        Serial.print(stationName);
-        Serial.println(" drying complete.");
-        persistStation(station, state);
-        drawDisplay();
+        completeStationSession(station, state, stationName);
         return;
     }
 
@@ -626,6 +682,8 @@ void setup() {
     if (!connectWiFi()) {
         startSetupPortal();
     } else {
+        timeService.begin();
+        timeService.waitForSync(5000);
         startRuntimeWebUI();
     }
 
