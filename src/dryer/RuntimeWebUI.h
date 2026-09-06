@@ -3,37 +3,11 @@
 #include <Arduino.h>
 #include <WebServer.h>
 
-#include "SpoolmanClient.h"
-
-// Implemented by the dryer application. Session-state transitions use this
-// to refresh the local OLED immediately when they change state.
-void drawDisplay();
-
-struct RuntimeStationView {
-    bool occupied = false;
-    String uid;
-    DryerSpoolInfo spool;
-    String lookupError;
-
-    String sessionStatus;
-    uint32_t remainingSeconds = 0;
-    int startThresholdC = 0;
-};
-
-struct RuntimeStatus {
-    float chamberTempC = 0.0f;
-    bool temperatureValid = false;
-    bool wifiConnected = false;
-    bool spoolmanConfigured = false;
-    bool nfcAvailable = false;
-    bool topSelected = false;
-    RuntimeStationView top;
-    RuntimeStationView bottom;
-};
+#include "DryerRuntimeTypes.h"
 
 class RuntimeWebUI {
 public:
-    using StatusProvider = RuntimeStatus (*)();
+    using StatusProvider = DryerRuntimeStatus (*)();
     using ClearHandler = void (*)(bool topStation);
 
     bool begin(StatusProvider statusProvider, ClearHandler clearHandler);
