@@ -17,13 +17,11 @@ public:
 private:
     void drawStationLine(
         int y,
-        const char* name,
-        DryerStation station,
         const DryerStationView& state,
-        DryerStation selectedStation
+        DryerStationId selectedStation
     );
 
-    static String stationLabel(const DryerStationView& state);
+    static String stationSpoolLabel(const DryerStationView& state);
     static String sessionCompact(const DryerStationView& state);
 
     uint8_t sdaPin_;
