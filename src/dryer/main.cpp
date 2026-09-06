@@ -525,7 +525,10 @@ void setup() {
 
     Wire.begin(OLED_SDA, OLED_SCL);
 
-    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    // Wire is already initialized with the dryer-specific SDA/SCL pins above.
+    // Tell Adafruit_SSD1306 not to call Wire.begin() a second time; the newer
+    // ESP32 Arduino core can otherwise leave the I2C peripheral invalid.
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false)) {
         Serial.println("SSD1306 initialization failed.");
         displayAvailable = false;
     } else {
