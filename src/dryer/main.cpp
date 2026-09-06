@@ -6,6 +6,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_PN532.h>
+#include <WiFi.h>
+
+#include "DryerConfig.h"
+#include "SpoolmanClient.h"
 
 // ---------- Pins ----------
 
