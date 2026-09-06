@@ -148,8 +148,45 @@ void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
 
     display_.clearDisplay();
     display_.setTextColor(SSD1306_WHITE);
-    display_.setTextSize(1);
 
+    // While any spool is waiting for chamber temperature, the most useful
+    // thing on the physical controller is the temperature the operator should
+    // set on the manual dryer. For a shared thermal zone this is the planner's
+    // recommended common setpoint, not the countdown-start threshold.
+    const bool waitingForTemp =
+        status.top.sessionStatus == "Waiting for temp" ||
+        status.bottom.sessionStatus == "Waiting for temp";
+
+    if (
+        waitingForTemp &&
+        status.temperaturePlan.automaticPlanUsable &&
+        status.temperaturePlan.recommendedTargetC > 0
+    ) {
+        String target = String(status.temperaturePlan.recommendedTargetC) + "C";
+
+        display_.setTextSize(5);
+        int16_t x1 = 0;
+        int16_t y1 = 0;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        display_.getTextBounds(target, 0, 0, &x1, &y1, &width, &height);
+
+        int16_t x = static_cast<int16_t>((DISPLAY_WIDTH - width) / 2);
+        int16_t y = static_cast<int16_t>((DISPLAY_HEIGHT - height) / 2);
+        if (x < 0) {
+            x = 0;
+        }
+        if (y < 0) {
+            y = 0;
+        }
+
+        display_.setCursor(x, y);
+        display_.print(target);
+        display_.display();
+        return;
+    }
+
+    display_.setTextSize(1);
     display_.setCursor(0, 0);
     display_.println("SpoolSense Dryer");
 
