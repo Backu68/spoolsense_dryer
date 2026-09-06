@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <WiFiClient.h>
 
@@ -42,7 +43,6 @@ private:
     String stationStateTopic(DryerStationId station) const;
 
     void addDeviceMetadata(JsonObject device) const;
-    static String slugify(const String& value);
     static void getDeviceId(char* buf, size_t bufSize);
 
     DryerConfig* config_ = nullptr;
