@@ -73,7 +73,9 @@ struct StationState {
     String lookupError;
 };
 
-DryerStation selectedStation = DryerStation::TOP;
+// A single-spool dryer uses the lower station, so BOTTOM is the natural
+// power-on/default target. TOP remains available when the second station is used.
+DryerStation selectedStation = DryerStation::BOTTOM;
 StationState topStation;
 StationState bottomStation;
 
