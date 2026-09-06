@@ -5,6 +5,10 @@
 
 #include "SpoolmanClient.h"
 
+// Implemented by the dryer application. Session-state transitions use this
+// to refresh the local OLED immediately when they change state.
+void drawDisplay();
+
 struct RuntimeStationView {
     bool occupied = false;
     String uid;
