@@ -43,6 +43,7 @@ private:
     String stationStateTopic(DryerStationId station) const;
 
     void addDeviceMetadata(JsonObject device) const;
+    static String slugify(const String& value);
     static void getDeviceId(char* buf, size_t bufSize);
 
     DryerConfig* config_ = nullptr;
