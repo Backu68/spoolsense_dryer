@@ -29,12 +29,13 @@ constexpr uint8_t PN532_CS   = 25;
 
 // ---------- OLED ----------
 
-constexpr uint8_t OLED_ADDRESS = 0x3C;
 constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
 
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 bool displayAvailable = false;
+bool i2cReady = false;
+uint8_t detectedOledAddress = 0;
 
 // ---------- Temperature ----------
 
@@ -91,7 +92,6 @@ unsigned long bottomDebounceTime = 0;
 unsigned long lastTemperatureRead = 0;
 float chamberTempC = DEVICE_DISCONNECTED_C;
 
-// Prevent the same tag from firing continuously while held on reader.
 String lastSeenUid;
 unsigned long lastTagSeenMs = 0;
 constexpr unsigned long TAG_REPEAT_BLOCK_MS = 2000;
@@ -150,16 +150,13 @@ void drawStationLine(
     const StationState& state
 ) {
     display.setCursor(0, y);
-
     display.print(selectedStation == station ? ">" : " ");
     display.print(name);
     display.print(": ");
 
     String label = getStationDisplayName(state);
-
-    // 128x64 at text size 1 gives roughly 21 characters across.
-    // Keep station rows on one line.
     constexpr size_t MAX_LABEL_CHARS = 14;
+
     if (label.length() > MAX_LABEL_CHARS) {
         label = label.substring(0, MAX_LABEL_CHARS);
     }
@@ -179,19 +176,8 @@ void drawDisplay() {
     display.setCursor(0, 0);
     display.println("SpoolSense Dryer");
 
-    drawStationLine(
-        16,
-        "TOP",
-        DryerStation::TOP,
-        topStation
-    );
-
-    drawStationLine(
-        28,
-        "BOT",
-        DryerStation::BOTTOM,
-        bottomStation
-    );
+    drawStationLine(16, "TOP", DryerStation::TOP, topStation);
+    drawStationLine(28, "BOT", DryerStation::BOTTOM, bottomStation);
 
     display.setCursor(0, 44);
 
@@ -258,11 +244,7 @@ void assignUidToSelectedStation(const String& uid) {
     Serial.print("Assigned UID ");
     Serial.print(uid);
     Serial.print(" to ");
-    Serial.println(
-        selectedStation == DryerStation::TOP
-            ? "TOP"
-            : "BOTTOM"
-    );
+    Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
 
     drawDisplay();
 
@@ -299,6 +281,69 @@ void assignUidToSelectedStation(const String& uid) {
     drawDisplay();
 }
 
+// ---------- I2C / OLED ----------
+
+void initOled() {
+    Serial.print("I2C begin SDA=");
+    Serial.print(OLED_SDA);
+    Serial.print(" SCL=");
+    Serial.println(OLED_SCL);
+
+    i2cReady = Wire.begin(OLED_SDA, OLED_SCL, 100000);
+
+    Serial.print("I2C begin result: ");
+    Serial.println(i2cReady ? "SUCCESS" : "FAILED");
+
+    if (!i2cReady) {
+        Serial.println("OLED disabled: I2C controller did not initialize.");
+        return;
+    }
+
+    Serial.println("I2C scan starting...");
+
+    for (uint8_t address = 1; address < 127; ++address) {
+        Wire.beginTransmission(address);
+        uint8_t error = Wire.endTransmission();
+
+        if (error == 0) {
+            Serial.print("I2C device found at 0x");
+            if (address < 0x10) {
+                Serial.print("0");
+            }
+            Serial.println(address, HEX);
+
+            if (address == 0x3C || address == 0x3D) {
+                detectedOledAddress = address;
+            }
+        }
+
+        delay(1);
+    }
+
+    if (detectedOledAddress == 0) {
+        Serial.println("OLED not found at 0x3C or 0x3D. Display disabled.");
+        return;
+    }
+
+    Serial.print("OLED detected at 0x");
+    Serial.println(detectedOledAddress, HEX);
+
+    // Wire is already initialized above. periphBegin=false prevents the
+    // SSD1306 library from reinitializing the ESP32 I2C peripheral.
+    if (!display.begin(
+            SSD1306_SWITCHCAPVCC,
+            detectedOledAddress,
+            true,
+            false
+        )) {
+        Serial.println("SSD1306 initialization failed.");
+        return;
+    }
+
+    displayAvailable = true;
+    Serial.println("SSD1306 initialized.");
+}
+
 // ---------- Wi-Fi ----------
 
 String makeHostname() {
@@ -327,7 +372,6 @@ bool connectWiFi() {
     Serial.print("WiFi hostname: ");
     Serial.println(hostname);
 
-    // Preserve the known-good SpoolSense DHCP hostname startup order.
     WiFi.mode(WIFI_MODE_NULL);
     delay(100);
     WiFi.setHostname(hostname.c_str());
@@ -336,10 +380,7 @@ bool connectWiFi() {
     Serial.print("Connecting to WiFi: ");
     Serial.println(dryerConfig.getSSID());
 
-    WiFi.begin(
-        dryerConfig.getSSID(),
-        dryerConfig.getPassword()
-    );
+    WiFi.begin(dryerConfig.getSSID(), dryerConfig.getPassword());
 
     unsigned long start = millis();
 
@@ -437,12 +478,7 @@ void handleButtons() {
 // ---------- NFC ----------
 
 void initNfc() {
-    SPI.begin(
-        PN532_SCK,
-        PN532_MISO,
-        PN532_MOSI,
-        PN532_CS
-    );
+    SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_CS);
 
     nfc.begin();
 
@@ -460,7 +496,6 @@ void initNfc() {
     Serial.println((version >> 8) & 0xFF);
 
     nfc.SAMConfig();
-
     nfcAvailable = true;
 
     Serial.println("PN532 ready for ISO14443A tags.");
@@ -486,7 +521,6 @@ void handleNfc() {
     }
 
     String uidString = uidToString(uid, uidLength);
-
     unsigned long now = millis();
 
     if (
@@ -523,18 +557,7 @@ void setup() {
 
     temperatureSensor.begin();
 
-    Wire.begin(OLED_SDA, OLED_SCL);
-
-    // Wire is already initialized with the dryer-specific SDA/SCL pins above.
-    // Tell Adafruit_SSD1306 not to call Wire.begin() a second time; the newer
-    // ESP32 Arduino core can otherwise leave the I2C peripheral invalid.
-    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false)) {
-        Serial.println("SSD1306 initialization failed.");
-        displayAvailable = false;
-    } else {
-        displayAvailable = true;
-        Serial.println("SSD1306 initialized.");
-    }
+    initOled();
 
     Serial.print("DS18B20 devices found: ");
     Serial.println(temperatureSensor.getDeviceCount());
