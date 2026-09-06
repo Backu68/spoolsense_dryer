@@ -5,11 +5,17 @@
 static constexpr const char* NVS_NAMESPACE = "dryer";
 
 bool DryerConfig::begin() {
+    ssid_ = "";
+    password_ = "";
+    spoolmanUrl_ = "";
+
     Preferences prefs;
 
+    // A brand-new device may not have the namespace yet. That is a normal
+    // first-boot state, not an error; the setup portal will create it on save.
     if (!prefs.begin(NVS_NAMESPACE, true)) {
-        Serial.println("DryerConfig: failed to open NVS.");
-        return false;
+        Serial.println("DryerConfig: no saved configuration.");
+        return true;
     }
 
     ssid_ = prefs.getString("ssid", "");
@@ -52,21 +58,35 @@ bool DryerConfig::save(
     const String& password,
     const String& spoolmanUrl
 ) {
+    String cleanSsid = ssid;
+    String cleanSpoolmanUrl = spoolmanUrl;
+
+    cleanSsid.trim();
+    cleanSpoolmanUrl.trim();
+
+    if (cleanSsid.isEmpty() || cleanSpoolmanUrl.isEmpty()) {
+        return false;
+    }
+
     Preferences prefs;
 
     if (!prefs.begin(NVS_NAMESPACE, false)) {
         return false;
     }
 
-    prefs.putString("ssid", ssid);
+    size_t writtenSsid = prefs.putString("ssid", cleanSsid);
     prefs.putString("wifi_pass", password);
-    prefs.putString("spoolman", spoolmanUrl);
+    size_t writtenSpoolman = prefs.putString("spoolman", cleanSpoolmanUrl);
 
     prefs.end();
 
-    ssid_ = ssid;
+    if (writtenSsid == 0 || writtenSpoolman == 0) {
+        return false;
+    }
+
+    ssid_ = cleanSsid;
     password_ = password;
-    spoolmanUrl_ = spoolmanUrl;
+    spoolmanUrl_ = cleanSpoolmanUrl;
 
     return true;
 }
