@@ -109,6 +109,23 @@ bool DryerSessionStore::save(
     return ok;
 }
 
+bool DryerSessionStore::checkpoint(
+    DryerStation station,
+    DryingSessionState sessionState,
+    uint32_t remainingSeconds
+) {
+    if (!ready_) {
+        return false;
+    }
+
+    prefs_.putUChar(
+        key(station, "state").c_str(),
+        static_cast<uint8_t>(sessionState)
+    );
+    prefs_.putUInt(key(station, "remain").c_str(), remainingSeconds);
+    return true;
+}
+
 bool DryerSessionStore::clear(DryerStation station) {
     if (!ready_) {
         return false;
