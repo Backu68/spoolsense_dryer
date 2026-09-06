@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "DryerTemperaturePlanner.h"
 #include "SpoolmanClient.h"
 
 // Shared application-facing dryer state. Hardware/UI backends consume these
@@ -28,6 +29,17 @@ struct DryerStationView {
     int startThresholdC = 0;
 };
 
+struct DryerTemperaturePlanView {
+    DryerTemperaturePlanState state = DryerTemperaturePlanState::NONE;
+    String status;
+    uint8_t spoolCount = 0;
+    int commonMinC = 0;
+    int commonMaxC = 0;
+    int recommendedTargetC = 0;
+    int compromiseGapC = 0;
+    bool automaticPlanUsable = false;
+};
+
 struct DryerRuntimeStatus {
     float chamberTempC = 0.0f;
     bool temperatureValid = false;
@@ -37,6 +49,11 @@ struct DryerRuntimeStatus {
     bool spoolmanConfigured = false;
     bool nfcAvailable = false;
     bool setupPortalActive = false;
+
+    // The current prototype is one thermal zone shared by TOP and BOTTOM.
+    // The planner itself accepts any number of spool profiles so this view can
+    // become a per-zone array when station/zone counts are generalized.
+    DryerTemperaturePlanView temperaturePlan;
 
     DryerStation selectedStation = DryerStation::BOTTOM;
     DryerStationView top;
