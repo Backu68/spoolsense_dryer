@@ -14,7 +14,8 @@ bool SetupPortal::begin(DryerConfig& config) {
         static_cast<unsigned long long>(chipId & 0xFFFFFFULL)
     );
 
-    apSsid_ = "SpoolSense-Dryer-" + String(suffix);
+    apSsid_ = "SpoolSense-Dryer-";
+    apSsid_ += suffix;
 
     WiFi.mode(WIFI_AP_STA);
 
@@ -78,7 +79,7 @@ String SetupPortal::htmlEscape(const String& value) {
             case '<': result += "&lt;"; break;
             case '>': result += "&gt;"; break;
             case '"': result += "&quot;"; break;
-            case '\'': result += "&#39;"; break;
+            case 39: result += "&#39;"; break;
             default: result += value.charAt(i); break;
         }
     }
@@ -124,7 +125,7 @@ void SetupPortal::handleRoot() {
         ".card{max-width:520px;margin:auto;background:#1d1d1d;padding:24px;border-radius:12px;}"
         "h1{font-size:24px;margin-top:0;}"
         "label{display:block;margin-top:16px;margin-bottom:6px;}"
-        "input,select{box-sizing:border-box;width:100%;padding:11px;border-radius:6px;border:1px solid #555;background:#292929;color:#fff;}"
+        "input{box-sizing:border-box;width:100%;padding:11px;border-radius:6px;border:1px solid #555;background:#292929;color:#fff;}"
         "button{width:100%;margin-top:22px;padding:12px;border:0;border-radius:6px;font-weight:bold;font-size:16px;}"
         ".small{font-size:13px;color:#aaa;margin-top:18px;}"
         "</style></head><body><div class='card'>"
@@ -132,13 +133,14 @@ void SetupPortal::handleRoot() {
         "<p>Configure Wi-Fi and Spoolman.</p>"
         "<form method='post' action='/save'>"
         "<label for='ssid'>Wi-Fi network</label>"
-        "<select id='ssid' name='ssid' required>"
+        "<input id='ssid' name='ssid' list='networks' autocomplete='off' required>"
+        "<datalist id='networks'>"
     );
 
     page += buildNetworkOptions();
 
     page += F(
-        "</select>"
+        "</datalist>"
         "<label for='password'>Wi-Fi password</label>"
         "<input id='password' name='password' type='password'>"
         "<label for='spoolman'>Spoolman URL</label>"
