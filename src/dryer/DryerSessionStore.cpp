@@ -47,7 +47,24 @@ bool DryerSessionStore::load(DryerStation station, DryerStationState& state) {
     state.spool.vendor = prefs_.getString(key(station, "vend").c_str(), "");
     state.spool.material = prefs_.getString(key(station, "mat").c_str(), "");
     state.spool.dryTempC = prefs_.getInt(key(station, "dtemp").c_str(), 0);
+    state.spool.dryTempMinC = prefs_.getInt(
+        key(station, "dtmin").c_str(),
+        state.spool.dryTempC
+    );
+    state.spool.dryTempMaxC = prefs_.getInt(
+        key(station, "dtmax").c_str(),
+        state.spool.dryTempC
+    );
     state.spool.dryTimeHours = prefs_.getInt(key(station, "dhrs").c_str(), 0);
+
+    // Records written before range support remain valid as single-temperature
+    // profiles instead of forcing an NVS format reset.
+    if (state.spool.dryTempMinC <= 0) {
+        state.spool.dryTempMinC = state.spool.dryTempC;
+    }
+    if (state.spool.dryTempMaxC <= 0) {
+        state.spool.dryTempMaxC = state.spool.dryTempC;
+    }
 
     uint8_t rawState = prefs_.getUChar(key(station, "state").c_str(), 0);
     if (rawState > static_cast<uint8_t>(DryingSessionState::COMPLETE)) {
@@ -110,6 +127,8 @@ bool DryerSessionStore::save(
     prefs_.putString(key(station, "vend").c_str(), state.spool.vendor);
     prefs_.putString(key(station, "mat").c_str(), state.spool.material);
     prefs_.putInt(key(station, "dtemp").c_str(), state.spool.dryTempC);
+    prefs_.putInt(key(station, "dtmin").c_str(), state.spool.dryTempMinC);
+    prefs_.putInt(key(station, "dtmax").c_str(), state.spool.dryTempMaxC);
     prefs_.putInt(key(station, "dhrs").c_str(), state.spool.dryTimeHours);
 
     prefs_.putUChar(
@@ -150,8 +169,8 @@ bool DryerSessionStore::clear(DryerStation station) {
 
     const char* suffixes[] = {
         "occ", "uid", "err", "found", "sid", "fid", "name", "vend",
-        "mat", "dtemp", "dhrs", "state", "total", "remain", "thresh",
-        "finish"
+        "mat", "dtemp", "dtmin", "dtmax", "dhrs", "state", "total",
+        "remain", "thresh", "finish"
     };
 
     for (const char* suffix : suffixes) {
