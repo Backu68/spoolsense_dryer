@@ -6,6 +6,7 @@
 namespace {
 constexpr int DISPLAY_WIDTH = 128;
 constexpr int DISPLAY_HEIGHT = 64;
+constexpr float SETPOINT_TOLERANCE_C = 1.0f;
 }
 
 SSD1306DryerDisplay::SSD1306DryerDisplay(
@@ -149,19 +150,38 @@ void SSD1306DryerDisplay::render(const DryerRuntimeStatus& status) {
     display_.clearDisplay();
     display_.setTextColor(SSD1306_WHITE);
 
-    // While any spool is waiting for chamber temperature, the most useful
-    // thing on the physical controller is the temperature the operator should
-    // set on the manual dryer. For a shared thermal zone this is the planner's
-    // recommended common setpoint, not the countdown-start threshold.
-    const bool waitingForTemp =
+    const bool sessionNeedsTemperature =
         status.top.sessionStatus == "Waiting for temp" ||
-        status.bottom.sessionStatus == "Waiting for temp";
+        status.top.sessionStatus == "Drying" ||
+        status.bottom.sessionStatus == "Waiting for temp" ||
+        status.bottom.sessionStatus == "Drying";
 
+    // This tiny display has very little real estate. While the operator still
+    // needs to move the manual dryer's temperature toward the calculated shared
+    // target, use the entire OLED for that instruction. The drying countdown is
+    // allowed to run as soon as target-5 C is reached, including when the chamber
+    // starts above target; the large setpoint stays visible until the chamber is
+    // within about 1 C of the recommended value.
+    bool showLargeSetpoint = false;
     if (
-        waitingForTemp &&
+        sessionNeedsTemperature &&
         status.temperaturePlan.automaticPlanUsable &&
         status.temperaturePlan.recommendedTargetC > 0
     ) {
+        if (!status.temperatureValid) {
+            showLargeSetpoint = true;
+        } else {
+            float difference =
+                status.chamberTempC -
+                static_cast<float>(status.temperaturePlan.recommendedTargetC);
+            if (difference < 0.0f) {
+                difference = -difference;
+            }
+            showLargeSetpoint = difference > SETPOINT_TOLERANCE_C;
+        }
+    }
+
+    if (showLargeSetpoint) {
         String target = String(status.temperaturePlan.recommendedTargetC) + "C";
 
         display_.setTextSize(5);
