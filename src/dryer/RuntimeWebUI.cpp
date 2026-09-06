@@ -69,6 +69,7 @@ void RuntimeWebUI::handleRoot() {
 <!doctype html>
 <html>
 <head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SpoolSense Dryer</title>
 <style>
@@ -78,7 +79,7 @@ void RuntimeWebUI::handleRoot() {
 <body><div class="wrap">
 <h1>SpoolSense Dryer</h1>
 <div class="summary">
-  <div class="row"><span class="label">Chamber</span><span id="temp" class="value">--.- °C</span></div>
+  <div class="row"><span class="label">Chamber</span><span id="temp" class="value">--.- &deg;C</span></div>
   <div class="row"><span class="label">Wi-Fi</span><span id="wifi" class="value">...</span></div>
   <div class="row"><span class="label">Spoolman</span><span id="spoolman" class="value">...</span></div>
   <div class="row"><span class="label">NFC</span><span id="nfc" class="value">...</span></div>
@@ -87,37 +88,39 @@ void RuntimeWebUI::handleRoot() {
   <div id="topCard" class="station">
     <div class="title"><h2>TOP</h2><span id="topSelected" class="badge">Selected</span></div>
     <div class="row"><span class="label">Spool</span><span id="topName" class="value">Empty</span></div>
-    <div class="row"><span class="label">Vendor</span><span id="topVendor" class="value">—</span></div>
-    <div class="row"><span class="label">Material</span><span id="topMaterial" class="value">—</span></div>
-    <div class="row"><span class="label">Dry temp</span><span id="topDryTemp" class="value">—</span></div>
-    <div class="row"><span class="label">Countdown starts</span><span id="topThreshold" class="value">—</span></div>
+    <div class="row"><span class="label">Vendor</span><span id="topVendor" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Material</span><span id="topMaterial" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Dry temp</span><span id="topDryTemp" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Countdown starts</span><span id="topThreshold" class="value">&mdash;</span></div>
     <div class="row"><span class="label">Session</span><span id="topSession" class="value">Inactive</span></div>
-    <div class="row"><span class="label">Remaining</span><span id="topRemaining" class="value">—</span></div>
-    <div class="row"><span class="label">UID</span><span id="topUid" class="value">—</span></div>
+    <div class="row"><span class="label">Remaining</span><span id="topRemaining" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">UID</span><span id="topUid" class="value">&mdash;</span></div>
     <div id="topError" class="muted"></div>
     <button onclick="clearStation('top')">Clear TOP</button>
   </div>
   <div id="bottomCard" class="station">
     <div class="title"><h2>BOTTOM</h2><span id="bottomSelected" class="badge">Selected</span></div>
     <div class="row"><span class="label">Spool</span><span id="bottomName" class="value">Empty</span></div>
-    <div class="row"><span class="label">Vendor</span><span id="bottomVendor" class="value">—</span></div>
-    <div class="row"><span class="label">Material</span><span id="bottomMaterial" class="value">—</span></div>
-    <div class="row"><span class="label">Dry temp</span><span id="bottomDryTemp" class="value">—</span></div>
-    <div class="row"><span class="label">Countdown starts</span><span id="bottomThreshold" class="value">—</span></div>
+    <div class="row"><span class="label">Vendor</span><span id="bottomVendor" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Material</span><span id="bottomMaterial" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Dry temp</span><span id="bottomDryTemp" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">Countdown starts</span><span id="bottomThreshold" class="value">&mdash;</span></div>
     <div class="row"><span class="label">Session</span><span id="bottomSession" class="value">Inactive</span></div>
-    <div class="row"><span class="label">Remaining</span><span id="bottomRemaining" class="value">—</span></div>
-    <div class="row"><span class="label">UID</span><span id="bottomUid" class="value">—</span></div>
+    <div class="row"><span class="label">Remaining</span><span id="bottomRemaining" class="value">&mdash;</span></div>
+    <div class="row"><span class="label">UID</span><span id="bottomUid" class="value">&mdash;</span></div>
     <div id="bottomError" class="muted"></div>
     <button onclick="clearStation('bottom')">Clear BOTTOM</button>
   </div>
 </div>
-<p class="muted">Countdown begins automatically when chamber temperature reaches 5 °C below the spool's drying temperature.</p>
+<p class="muted">Countdown begins automatically when chamber temperature reaches 5 &deg;C below the spool's drying temperature.</p>
 </div>
 <script>
 const el=id=>document.getElementById(id);
+const DASH='\u2014';
+const DEG_C=' \u00B0C';
 function setHealth(id,ok,good,bad){const n=el(id);n.textContent=ok?good:bad;n.className='value '+(ok?'ok':'bad')}
 function formatRemaining(seconds){
-  if(seconds===null||seconds===undefined)return '—';
+  if(seconds===null||seconds===undefined)return DASH;
   const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;
   return h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
 }
@@ -125,21 +128,21 @@ function updateStation(prefix,s,selected){
   el(prefix+'Card').classList.toggle('selected',selected);
   el(prefix+'Selected').style.visibility=selected?'visible':'hidden';
   el(prefix+'Name').textContent=s.occupied?(s.name||s.material||'Unknown spool'):'Empty';
-  el(prefix+'Vendor').textContent=s.vendor||'—';
-  el(prefix+'Material').textContent=s.material||'—';
-  el(prefix+'DryTemp').textContent=s.dry_temp_c>0?s.dry_temp_c+' °C':'—';
-  el(prefix+'Threshold').textContent=s.start_threshold_c>0?s.start_threshold_c+' °C':'—';
+  el(prefix+'Vendor').textContent=s.vendor||DASH;
+  el(prefix+'Material').textContent=s.material||DASH;
+  el(prefix+'DryTemp').textContent=s.dry_temp_c>0?s.dry_temp_c+DEG_C:DASH;
+  el(prefix+'Threshold').textContent=s.start_threshold_c>0?s.start_threshold_c+DEG_C:DASH;
   const session=el(prefix+'Session');
   session.textContent=s.session_status||'Inactive';
   session.className='value '+(s.session_status==='Waiting for temp'?'waiting':s.session_status==='Drying'?'drying':s.session_status==='Complete'?'complete':'');
-  el(prefix+'Remaining').textContent=(s.session_status&&s.session_status!=='Inactive')?formatRemaining(s.remaining_seconds):'—';
-  el(prefix+'Uid').textContent=s.uid||'—';
+  el(prefix+'Remaining').textContent=(s.session_status&&s.session_status!=='Inactive')?formatRemaining(s.remaining_seconds):DASH;
+  el(prefix+'Uid').textContent=s.uid||DASH;
   el(prefix+'Error').textContent=s.lookup_error||'';
 }
 async function refresh(){
   try{
     const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error();const s=await r.json();
-    el('temp').textContent=s.temperature_valid?s.temperature_c.toFixed(2)+' °C':'--.- °C';
+    el('temp').textContent=s.temperature_valid?s.temperature_c.toFixed(2)+DEG_C:'--.-'+DEG_C;
     setHealth('wifi',s.wifi_connected,'Connected','Offline');
     setHealth('spoolman',s.spoolman_configured,'Configured','Not configured');
     setHealth('nfc',s.nfc_available,'Ready','Unavailable');
@@ -156,7 +159,7 @@ refresh();setInterval(refresh,1000);
 </html>
 )rawliteral";
 
-    server_.send_P(200, "text/html", PAGE);
+    server_.send_P(200, "text/html; charset=utf-8", PAGE);
 }
 
 void RuntimeWebUI::handleStatus() {
@@ -191,7 +194,7 @@ void RuntimeWebUI::handleStatus() {
 
     String payload;
     serializeJson(doc, payload);
-    server_.send(200, "application/json", payload);
+    server_.send(200, "application/json; charset=utf-8", payload);
 }
 
 void RuntimeWebUI::handleClear() {
