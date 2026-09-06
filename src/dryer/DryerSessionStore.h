@@ -24,13 +24,18 @@ struct DryerStationState {
 };
 
 // NVS-backed persistence for assigned spools and drying-session progress.
-// Active timers are periodically checkpointed rather than written every second
-// to avoid unnecessary flash wear.
+// Full station records are written only when assignments/state change; active
+// timers use a small periodic checkpoint to limit flash wear.
 class DryerSessionStore {
 public:
     bool begin();
     bool load(DryerStation station, DryerStationState& state);
     bool save(DryerStation station, const DryerStationState& state);
+    bool checkpoint(
+        DryerStation station,
+        DryingSessionState sessionState,
+        uint32_t remainingSeconds
+    );
     bool clear(DryerStation station);
 
 private:
