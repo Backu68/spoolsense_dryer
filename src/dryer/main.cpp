@@ -1,22 +1,21 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <SPI.h>
 #include <WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_PN532.h>
 
 #include "DryerConfig.h"
-#include "SetupPortal.h"
+#include "DryerDisplayI.h"
+#include "DryerNfcI.h"
+#include "DryerRuntimeTypes.h"
+#include "PN532DryerNfc.h"
 #include "RuntimeWebUI.h"
+#include "SSD1306DryerDisplay.h"
+#include "SetupPortal.h"
 #include "SpoolmanClient.h"
 
-// ---------- Pins ----------
+// ---------- Board pins ----------
 
 constexpr uint8_t PIN_TEMP = 27;
-
 constexpr uint8_t PIN_BUTTON_TOP = 32;
 constexpr uint8_t PIN_BUTTON_BOTTOM = 33;
 
@@ -25,30 +24,30 @@ constexpr uint8_t PIN_BUTTON_BOTTOM = 33;
 //   OLED SCL -> P22 (GPIO22) -- NOT the nearby TX pin
 constexpr uint8_t OLED_SDA = 21;
 constexpr uint8_t OLED_SCL = 22;
+constexpr uint8_t OLED_ADDRESS = 0x3C;
 
 constexpr uint8_t PN532_SCK  = 18;
 constexpr uint8_t PN532_MISO = 19;
 constexpr uint8_t PN532_MOSI = 23;
 constexpr uint8_t PN532_CS   = 25;
 
-// ---------- OLED ----------
+// ---------- Hardware backends ----------
+//
+// Application code below talks only to DryerDisplayI / DryerNfcI. Additional
+// SpoolSense-supported displays and NFC readers can be added as backends without
+// changing the dryer session logic.
 
-constexpr uint8_t OLED_ADDRESS = 0x3C;
-constexpr int OLED_WIDTH = 128;
-constexpr int OLED_HEIGHT = 64;
+SSD1306DryerDisplay ssd1306Display(OLED_SDA, OLED_SCL, OLED_ADDRESS);
+DryerDisplayI* activeDisplay = &ssd1306Display;
 
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
-bool displayAvailable = false;
+PN532DryerNfc pn532Reader(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_CS);
+DryerNfcI* activeNfc = &pn532Reader;
+bool nfcAvailable = false;
 
 // ---------- Temperature ----------
 
 OneWire oneWire(PIN_TEMP);
 DallasTemperature temperatureSensor(&oneWire);
-
-// ---------- NFC ----------
-
-Adafruit_PN532 nfc(PN532_CS, &SPI);
-bool nfcAvailable = false;
 
 // ---------- Connectivity ----------
 
@@ -60,18 +59,6 @@ SpoolmanClient spoolman;
 bool wifiConnected = false;
 
 // ---------- Dryer state ----------
-
-enum class DryerStation {
-    TOP,
-    BOTTOM
-};
-
-enum class DryingSessionState {
-    INACTIVE,
-    WAITING_FOR_TEMP,
-    DRYING,
-    COMPLETE
-};
 
 struct StationState {
     bool occupied = false;
@@ -115,6 +102,11 @@ constexpr unsigned long TAG_REPEAT_BLOCK_MS = 2000;
 
 constexpr int SESSION_START_OFFSET_C = 5;
 
+// ---------- Forward declarations ----------
+
+DryerRuntimeStatus getRuntimeStatus();
+void drawDisplay();
+
 // ---------- Helpers ----------
 
 bool chamberTemperatureValid() {
@@ -155,66 +147,6 @@ const char* sessionStateText(DryingSessionState state) {
         default:
             return "Inactive";
     }
-}
-
-String formatSessionCompact(const StationState& state) {
-    switch (state.sessionState) {
-        case DryingSessionState::WAITING_FOR_TEMP:
-            return "WAIT";
-        case DryingSessionState::COMPLETE:
-            return "DONE";
-        case DryingSessionState::INACTIVE:
-            return "--";
-        case DryingSessionState::DRYING:
-        default:
-            break;
-    }
-
-    uint32_t hours = state.remainingSeconds / 3600UL;
-    uint32_t minutes = (state.remainingSeconds % 3600UL) / 60UL;
-    uint32_t seconds = state.remainingSeconds % 60UL;
-
-    char buffer[12];
-    if (hours > 0) {
-        snprintf(
-            buffer,
-            sizeof(buffer),
-            "%lu:%02lu",
-            static_cast<unsigned long>(hours),
-            static_cast<unsigned long>(minutes)
-        );
-    } else {
-        snprintf(
-            buffer,
-            sizeof(buffer),
-            "%02lu:%02lu",
-            static_cast<unsigned long>(minutes),
-            static_cast<unsigned long>(seconds)
-        );
-    }
-
-    return String(buffer);
-}
-
-String getStationDisplayName(const StationState& state) {
-    if (!state.occupied) {
-        return "Empty";
-    }
-
-    if (state.spool.found) {
-        if (!state.spool.name.isEmpty()) {
-            return state.spool.name;
-        }
-        if (!state.spool.material.isEmpty()) {
-            return state.spool.material;
-        }
-    }
-
-    if (!state.lookupError.isEmpty()) {
-        return "Unknown";
-    }
-
-    return state.uid;
 }
 
 void configureStationSession(StationState& state, const char* stationName) {
@@ -297,8 +229,8 @@ void updateStationSession(
     state.remainingSeconds -= elapsedSeconds;
 }
 
-RuntimeStationView makeRuntimeStationView(const StationState& state) {
-    RuntimeStationView view;
+DryerStationView makeRuntimeStationView(const StationState& state) {
+    DryerStationView view;
     view.occupied = state.occupied;
     view.uid = state.uid;
     view.spool = state.spool;
@@ -309,83 +241,27 @@ RuntimeStationView makeRuntimeStationView(const StationState& state) {
     return view;
 }
 
-RuntimeStatus getRuntimeStatus() {
-    RuntimeStatus status;
+DryerRuntimeStatus getRuntimeStatus() {
+    DryerRuntimeStatus status;
     status.chamberTempC = chamberTempC;
     status.temperatureValid = chamberTemperatureValid();
     status.wifiConnected = wifiConnected;
+    if (wifiConnected) {
+        status.ipAddress = WiFi.localIP().toString();
+    }
     status.spoolmanConfigured = dryerConfig.hasSpoolman();
     status.nfcAvailable = nfcAvailable;
-    status.topSelected = selectedStation == DryerStation::TOP;
+    status.setupPortalActive = setupPortal.isActive();
+    status.selectedStation = selectedStation;
     status.top = makeRuntimeStationView(topStation);
     status.bottom = makeRuntimeStationView(bottomStation);
     return status;
 }
 
-void drawStationLine(
-    int y,
-    const char* name,
-    DryerStation station,
-    const StationState& state
-) {
-    display.setCursor(0, y);
-    display.print(selectedStation == station ? ">" : " ");
-    display.print(name);
-    display.print(":");
-
-    String label = getStationDisplayName(state);
-    constexpr size_t MAX_LABEL_CHARS = 8;
-
-    if (label.length() > MAX_LABEL_CHARS) {
-        label = label.substring(0, MAX_LABEL_CHARS);
-    }
-
-    display.print(label);
-
-    if (state.occupied) {
-        display.print(" ");
-        display.print(formatSessionCompact(state));
-    }
-}
-
 void drawDisplay() {
-    if (!displayAvailable) {
-        return;
+    if (activeDisplay != nullptr && activeDisplay->isAvailable()) {
+        activeDisplay->render(getRuntimeStatus());
     }
-
-    display.clearDisplay();
-    display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
-
-    display.setCursor(0, 0);
-    display.println("SpoolSense Dryer");
-
-    drawStationLine(16, "TOP", DryerStation::TOP, topStation);
-    drawStationLine(28, "BOT", DryerStation::BOTTOM, bottomStation);
-
-    display.setCursor(0, 44);
-
-    if (!nfcAvailable) {
-        display.print("NFC: ERROR");
-    } else if (setupPortal.isActive()) {
-        display.print("SETUP AP ACTIVE");
-    } else if (wifiConnected) {
-        display.print("WiFi: Connected");
-    } else {
-        display.print("WiFi: Offline");
-    }
-
-    display.setCursor(0, 54);
-    display.print("Temp: ");
-
-    if (!chamberTemperatureValid()) {
-        display.print("--.- C");
-    } else {
-        display.print(chamberTempC, 1);
-        display.print(" C");
-    }
-
-    display.display();
 }
 
 void clearRuntimeStation(bool top) {
@@ -480,37 +356,18 @@ void assignUidToSelectedStation(const String& uid) {
     drawDisplay();
 }
 
-// ---------- I2C / OLED ----------
+// ---------- Display ----------
 
-void initOled() {
-    if (!Wire.begin(OLED_SDA, OLED_SCL, 100000)) {
-        Serial.println("OLED disabled: I2C controller failed to initialize.");
+void initDisplay() {
+    if (activeDisplay == nullptr || !activeDisplay->begin()) {
+        Serial.println("Dryer display unavailable.");
         return;
     }
 
-    // Verify that the known 0x3C OLED is physically present before starting
-    // the display driver. This avoids repeated I2C errors if the display is
-    // unplugged or miswired.
-    Wire.beginTransmission(OLED_ADDRESS);
-    if (Wire.endTransmission() != 0) {
-        Serial.println("OLED not detected at 0x3C. Display disabled.");
-        return;
-    }
-
-    // Wire is already initialized with the dryer-specific P21/P22 pins.
-    // periphBegin=false prevents Adafruit_SSD1306 from reinitializing I2C.
-    if (!display.begin(
-            SSD1306_SWITCHCAPVCC,
-            OLED_ADDRESS,
-            true,
-            false
-        )) {
-        Serial.println("SSD1306 initialization failed.");
-        return;
-    }
-
-    displayAvailable = true;
-    Serial.println("SSD1306 initialized at 0x3C on P21/P22.");
+    char info[48];
+    activeDisplay->getDisplayInfo(info, sizeof(info));
+    Serial.print("Dryer display: ");
+    Serial.println(info);
 }
 
 // ---------- Wi-Fi ----------
@@ -652,43 +509,28 @@ void handleButtons() {
 // ---------- NFC ----------
 
 void initNfc() {
-    SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_CS);
-    nfc.begin();
+    nfcAvailable = activeNfc != nullptr && activeNfc->begin();
 
-    uint32_t version = nfc.getFirmwareVersion();
-
-    if (!version) {
-        Serial.println("PN532 not detected.");
-        nfcAvailable = false;
+    if (!nfcAvailable) {
+        Serial.println("Dryer NFC reader unavailable.");
         return;
     }
 
-    Serial.print("PN532 detected. Firmware ");
-    Serial.print((version >> 16) & 0xFF);
-    Serial.print(".");
-    Serial.println((version >> 8) & 0xFF);
-
-    nfc.SAMConfig();
-    nfcAvailable = true;
-    Serial.println("PN532 ready for ISO14443A tags.");
+    char info[48];
+    activeNfc->getReaderInfo(info, sizeof(info));
+    Serial.print("Dryer NFC reader: ");
+    Serial.println(info);
 }
 
 void handleNfc() {
-    if (!nfcAvailable) {
+    if (!nfcAvailable || activeNfc == nullptr) {
         return;
     }
 
-    uint8_t uid[7];
+    uint8_t uid[10];
     uint8_t uidLength = 0;
 
-    bool found = nfc.readPassiveTargetID(
-        PN532_MIFARE_ISO14443A,
-        uid,
-        &uidLength,
-        20
-    );
-
-    if (!found) {
+    if (!activeNfc->detectTag(uid, &uidLength, 20)) {
         return;
     }
 
@@ -728,7 +570,7 @@ void setup() {
     pinMode(PIN_BUTTON_BOTTOM, INPUT_PULLUP);
 
     temperatureSensor.begin();
-    initOled();
+    initDisplay();
 
     Serial.print("DS18B20 devices found: ");
     Serial.println(temperatureSensor.getDeviceCount());
