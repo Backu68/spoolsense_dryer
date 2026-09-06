@@ -66,11 +66,24 @@ enum class DryerStation {
     BOTTOM
 };
 
+enum class DryingSessionState {
+    INACTIVE,
+    WAITING_FOR_TEMP,
+    DRYING,
+    COMPLETE
+};
+
 struct StationState {
     bool occupied = false;
     String uid;
     DryerSpoolInfo spool;
     String lookupError;
+
+    DryingSessionState sessionState = DryingSessionState::INACTIVE;
+    uint32_t totalSeconds = 0;
+    uint32_t remainingSeconds = 0;
+    int startThresholdC = 0;
+    unsigned long lastSessionTickMs = 0;
 };
 
 // A single-spool dryer uses the lower station, so BOTTOM is the natural
@@ -100,7 +113,15 @@ String lastSeenUid;
 unsigned long lastTagSeenMs = 0;
 constexpr unsigned long TAG_REPEAT_BLOCK_MS = 2000;
 
+constexpr int SESSION_START_OFFSET_C = 5;
+
 // ---------- Helpers ----------
+
+bool chamberTemperatureValid() {
+    return chamberTempC != DEVICE_DISCONNECTED_C &&
+           chamberTempC >= -55.0f &&
+           chamberTempC <= 125.0f;
+}
 
 String uidToString(const uint8_t* uid, uint8_t uidLength) {
     String result;
@@ -122,6 +143,59 @@ StationState& getSelectedStation() {
         : bottomStation;
 }
 
+const char* sessionStateText(DryingSessionState state) {
+    switch (state) {
+        case DryingSessionState::WAITING_FOR_TEMP:
+            return "Waiting for temp";
+        case DryingSessionState::DRYING:
+            return "Drying";
+        case DryingSessionState::COMPLETE:
+            return "Complete";
+        case DryingSessionState::INACTIVE:
+        default:
+            return "Inactive";
+    }
+}
+
+String formatSessionCompact(const StationState& state) {
+    switch (state.sessionState) {
+        case DryingSessionState::WAITING_FOR_TEMP:
+            return "WAIT";
+        case DryingSessionState::COMPLETE:
+            return "DONE";
+        case DryingSessionState::INACTIVE:
+            return "--";
+        case DryingSessionState::DRYING:
+        default:
+            break;
+    }
+
+    uint32_t hours = state.remainingSeconds / 3600UL;
+    uint32_t minutes = (state.remainingSeconds % 3600UL) / 60UL;
+    uint32_t seconds = state.remainingSeconds % 60UL;
+
+    char buffer[12];
+    if (hours > 0) {
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "%lu:%02lu",
+            static_cast<unsigned long>(hours),
+            static_cast<unsigned long>(minutes)
+        );
+    } else {
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "%02lu:%02lu",
+            static_cast<unsigned long>(minutes),
+            static_cast<unsigned long>(seconds)
+        );
+    }
+
+    return String(buffer);
+}
+
 String getStationDisplayName(const StationState& state) {
     if (!state.occupied) {
         return "Empty";
@@ -137,10 +211,90 @@ String getStationDisplayName(const StationState& state) {
     }
 
     if (!state.lookupError.isEmpty()) {
-        return "Unknown spool";
+        return "Unknown";
     }
 
     return state.uid;
+}
+
+void configureStationSession(StationState& state, const char* stationName) {
+    state.sessionState = DryingSessionState::INACTIVE;
+    state.totalSeconds = 0;
+    state.remainingSeconds = 0;
+    state.startThresholdC = 0;
+    state.lastSessionTickMs = 0;
+
+    if (!state.spool.found ||
+        state.spool.dryTempC <= 0 ||
+        state.spool.dryTimeHours <= 0) {
+        Serial.print(stationName);
+        Serial.println(" drying session inactive: dry profile is incomplete.");
+        return;
+    }
+
+    state.totalSeconds =
+        static_cast<uint32_t>(state.spool.dryTimeHours) * 3600UL;
+    state.remainingSeconds = state.totalSeconds;
+    state.startThresholdC = state.spool.dryTempC - SESSION_START_OFFSET_C;
+    if (state.startThresholdC < 0) {
+        state.startThresholdC = 0;
+    }
+    state.sessionState = DryingSessionState::WAITING_FOR_TEMP;
+
+    Serial.print(stationName);
+    Serial.print(" session waiting for ");
+    Serial.print(state.startThresholdC);
+    Serial.print(" C; duration ");
+    Serial.print(state.spool.dryTimeHours);
+    Serial.println(" h.");
+}
+
+void updateStationSession(
+    StationState& state,
+    const char* stationName,
+    unsigned long now
+) {
+    if (state.sessionState == DryingSessionState::WAITING_FOR_TEMP) {
+        if (
+            chamberTemperatureValid() &&
+            chamberTempC >= static_cast<float>(state.startThresholdC)
+        ) {
+            state.sessionState = DryingSessionState::DRYING;
+            state.lastSessionTickMs = now;
+
+            Serial.print(stationName);
+            Serial.print(" drying started at chamber temperature ");
+            Serial.print(chamberTempC, 2);
+            Serial.println(" C.");
+
+            drawDisplay();
+        }
+        return;
+    }
+
+    if (state.sessionState != DryingSessionState::DRYING) {
+        return;
+    }
+
+    unsigned long elapsedMs = now - state.lastSessionTickMs;
+    if (elapsedMs < 1000UL) {
+        return;
+    }
+
+    uint32_t elapsedSeconds = elapsedMs / 1000UL;
+    state.lastSessionTickMs += elapsedSeconds * 1000UL;
+
+    if (elapsedSeconds >= state.remainingSeconds) {
+        state.remainingSeconds = 0;
+        state.sessionState = DryingSessionState::COMPLETE;
+
+        Serial.print(stationName);
+        Serial.println(" drying complete.");
+        drawDisplay();
+        return;
+    }
+
+    state.remainingSeconds -= elapsedSeconds;
 }
 
 RuntimeStationView makeRuntimeStationView(const StationState& state) {
@@ -149,13 +303,16 @@ RuntimeStationView makeRuntimeStationView(const StationState& state) {
     view.uid = state.uid;
     view.spool = state.spool;
     view.lookupError = state.lookupError;
+    view.sessionStatus = sessionStateText(state.sessionState);
+    view.remainingSeconds = state.remainingSeconds;
+    view.startThresholdC = state.startThresholdC;
     return view;
 }
 
 RuntimeStatus getRuntimeStatus() {
     RuntimeStatus status;
     status.chamberTempC = chamberTempC;
-    status.temperatureValid = chamberTempC != DEVICE_DISCONNECTED_C;
+    status.temperatureValid = chamberTemperatureValid();
     status.wifiConnected = wifiConnected;
     status.spoolmanConfigured = dryerConfig.hasSpoolman();
     status.nfcAvailable = nfcAvailable;
@@ -174,16 +331,21 @@ void drawStationLine(
     display.setCursor(0, y);
     display.print(selectedStation == station ? ">" : " ");
     display.print(name);
-    display.print(": ");
+    display.print(":");
 
     String label = getStationDisplayName(state);
-    constexpr size_t MAX_LABEL_CHARS = 14;
+    constexpr size_t MAX_LABEL_CHARS = 8;
 
     if (label.length() > MAX_LABEL_CHARS) {
         label = label.substring(0, MAX_LABEL_CHARS);
     }
 
     display.print(label);
+
+    if (state.occupied) {
+        display.print(" ");
+        display.print(formatSessionCompact(state));
+    }
 }
 
 void drawDisplay() {
@@ -216,7 +378,7 @@ void drawDisplay() {
     display.setCursor(0, 54);
     display.print("Temp: ");
 
-    if (chamberTempC == DEVICE_DISCONNECTED_C) {
+    if (!chamberTemperatureValid()) {
         display.print("--.- C");
     } else {
         display.print(chamberTempC, 1);
@@ -269,16 +431,18 @@ void printSpoolDetails(const DryerSpoolInfo& spool) {
 
 void assignUidToSelectedStation(const String& uid) {
     StationState& station = getSelectedStation();
+    const char* stationName =
+        selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM";
 
+    // A new scan replaces the prior station assignment and session.
+    station = StationState{};
     station.occupied = true;
     station.uid = uid;
-    station.spool = DryerSpoolInfo{};
-    station.lookupError = "";
 
     Serial.print("Assigned UID ");
     Serial.print(uid);
     Serial.print(" to ");
-    Serial.println(selectedStation == DryerStation::TOP ? "TOP" : "BOTTOM");
+    Serial.println(stationName);
 
     drawDisplay();
 
@@ -306,6 +470,7 @@ void assignUidToSelectedStation(const String& uid) {
         station.spool = spoolInfo;
         station.lookupError = "";
         printSpoolDetails(station.spool);
+        configureStationSession(station, stationName);
     } else {
         station.lookupError = error;
         Serial.print("Spoolman lookup failed: ");
@@ -590,6 +755,9 @@ void loop() {
     handleNfc();
 
     unsigned long now = millis();
+
+    updateStationSession(topStation, "TOP", now);
+    updateStationSession(bottomStation, "BOTTOM", now);
 
     if ((now - lastTemperatureRead) >= 2000) {
         lastTemperatureRead = now;
