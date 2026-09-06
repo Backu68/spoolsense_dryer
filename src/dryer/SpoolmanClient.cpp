@@ -40,15 +40,153 @@ int SpoolmanClient::readExtraInt(JsonVariantConst value) {
     }
 
     if (value.is<float>()) {
-        return static_cast<int>(value.as<float>());
+        return static_cast<int>(value.as<float>() + 0.5f);
     }
 
     if (value.is<const char*>()) {
         String text = cleanExtraValue(value.as<const char*>());
-        return text.toInt();
+        return static_cast<int>(text.toFloat() + 0.5f);
     }
 
     return 0;
+}
+
+uint8_t SpoolmanClient::extractPositiveInts(
+    const String& text,
+    int* values,
+    uint8_t maxValues
+) {
+    if (values == nullptr || maxValues == 0) {
+        return 0;
+    }
+
+    uint8_t count = 0;
+    String token;
+    bool decimalSeen = false;
+
+    auto flushToken = [&]() {
+        if (token.isEmpty() || count >= maxValues) {
+            token = "";
+            decimalSeen = false;
+            return;
+        }
+
+        float parsed = token.toFloat();
+        if (parsed > 0.0f) {
+            values[count++] = static_cast<int>(parsed + 0.5f);
+        }
+
+        token = "";
+        decimalSeen = false;
+    };
+
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text.charAt(i);
+
+        if (c >= '0' && c <= '9') {
+            token += c;
+            continue;
+        }
+
+        if (c == '.' && !token.isEmpty() && !decimalSeen) {
+            token += c;
+            decimalSeen = true;
+            continue;
+        }
+
+        flushToken();
+        if (count >= maxValues) {
+            break;
+        }
+    }
+
+    if (count < maxValues) {
+        flushToken();
+    }
+
+    return count;
+}
+
+void SpoolmanClient::readDryTemperatureProfile(
+    JsonObjectConst extra,
+    DryerSpoolInfo& spool
+) {
+    int parsedMin = 0;
+    int parsedPreferred = 0;
+    int parsedMax = 0;
+
+    JsonVariantConst dryTemp = extra["dry_temp"];
+
+    if (dryTemp.is<int>() || dryTemp.is<float>()) {
+        parsedPreferred = readExtraInt(dryTemp);
+        parsedMin = parsedPreferred;
+        parsedMax = parsedPreferred;
+    } else if (dryTemp.is<const char*>()) {
+        String text = cleanExtraValue(dryTemp.as<const char*>());
+        int values[3] = {0, 0, 0};
+        uint8_t count = extractPositiveInts(text, values, 3);
+
+        if (count == 1) {
+            parsedMin = values[0];
+            parsedPreferred = values[0];
+            parsedMax = values[0];
+        } else if (count >= 2) {
+            parsedMin = min(values[0], values[count - 1]);
+            parsedMax = max(values[0], values[count - 1]);
+            parsedPreferred = (parsedMin + parsedMax + 1) / 2;
+
+            // A three-number form such as "55/60/65" may be used to express
+            // min/preferred/max explicitly.
+            if (count >= 3 && values[1] >= parsedMin && values[1] <= parsedMax) {
+                parsedPreferred = values[1];
+            }
+        }
+    }
+
+    // Explicit fields take precedence when present. Supporting both forms lets
+    // installations use either one range-valued custom field or three separate
+    // custom fields without changing firmware.
+    int explicitMin = readExtraInt(extra["dry_temp_min"]);
+    int explicitPreferred = readExtraInt(extra["dry_temp_preferred"]);
+    int explicitMax = readExtraInt(extra["dry_temp_max"]);
+
+    if (explicitMin > 0) {
+        parsedMin = explicitMin;
+    }
+    if (explicitMax > 0) {
+        parsedMax = explicitMax;
+    }
+    if (explicitPreferred > 0) {
+        parsedPreferred = explicitPreferred;
+    }
+
+    if (parsedMin <= 0 && parsedPreferred > 0) {
+        parsedMin = parsedPreferred;
+    }
+    if (parsedMax <= 0 && parsedPreferred > 0) {
+        parsedMax = parsedPreferred;
+    }
+
+    if (parsedMin > 0 && parsedMax > 0 && parsedMin > parsedMax) {
+        int swap = parsedMin;
+        parsedMin = parsedMax;
+        parsedMax = swap;
+    }
+
+    if (parsedPreferred <= 0 && parsedMin > 0 && parsedMax > 0) {
+        parsedPreferred = (parsedMin + parsedMax + 1) / 2;
+    }
+
+    if (parsedPreferred > 0 && parsedMin > 0 && parsedPreferred < parsedMin) {
+        parsedPreferred = parsedMin;
+    }
+    if (parsedPreferred > 0 && parsedMax > 0 && parsedPreferred > parsedMax) {
+        parsedPreferred = parsedMax;
+    }
+
+    spool.dryTempMinC = parsedMin;
+    spool.dryTempC = parsedPreferred;
+    spool.dryTempMaxC = parsedMax;
 }
 
 bool SpoolmanClient::lookupByUid(
@@ -149,14 +287,14 @@ bool SpoolmanClient::lookupByUid(
                 filament["vendor"]["name"] | "";
         }
 
-        spool.dryTempC =
-            readExtraInt(
-                filament["extra"]["dry_temp"]
-            );
+        JsonObjectConst filamentExtra =
+            filament["extra"].as<JsonObjectConst>();
+
+        readDryTemperatureProfile(filamentExtra, spool);
 
         spool.dryTimeHours =
             readExtraInt(
-                filament["extra"]["dry_time_hours"]
+                filamentExtra["dry_time_hours"]
             );
 
         // If Spoolman doesn't have a product name, at least give
