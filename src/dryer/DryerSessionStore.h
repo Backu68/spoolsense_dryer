@@ -34,21 +34,24 @@ struct DryerStationState {
 class DryerSessionStore {
 public:
     bool begin();
-    bool load(DryerStation station, DryerStationState& state);
-    bool save(DryerStation station, const DryerStationState& state);
+    bool load(DryerStationId station, DryerStationState& state);
+    bool save(DryerStationId station, const DryerStationState& state);
     bool checkpoint(
-        DryerStation station,
+        DryerStationId station,
         DryingSessionState sessionState,
         uint32_t remainingSeconds,
         uint32_t finishEpoch
     );
-    bool clear(DryerStation station);
+    bool clear(DryerStationId station);
 
 private:
-    String key(DryerStation station, const char* suffix) const;
+    String key(DryerStationId station, const char* suffix) const;
 
     Preferences prefs_;
     bool ready_ = false;
 
+    // Keep format 1 because the first two stations deliberately retain the old
+    // t_/b_ key prefixes. Existing retrofit sessions therefore survive this
+    // station-array refactor without an NVS wipe.
     static constexpr uint8_t FORMAT_VERSION = 1;
 };
